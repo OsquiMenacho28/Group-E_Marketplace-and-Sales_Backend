@@ -1,0 +1,187 @@
+services:
+  # ----------------------------------------------------------------------------
+  # REDIS - Caché distribuido y reserva de stock temporal
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: maxiconecta-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - maxiconecta-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # API GATEWAY (FastAPI Reverse Proxy & Security Hub)
+  # ----------------------------------------------------------------------------
+  api-gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: maxiconecta-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - PORT=8000
+      - REDIS_URL=redis://redis:6379/0
+      - MS_CATALOGO_URL=http://ms-catalogo:8001
+      - MS_POS_URL=http://ms-pos:8002
+      - MS_CARRITO_URL=http://ms-carrito:8003
+      - MS_CLIENTES_URL=http://ms-clientes:8004
+      - MS_ORDENES_URL=http://ms-ordenes:8005
+      - MS_REPORTES_URL=http://ms-reportes:8006
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - maxiconecta-net
+
+  # ----------------------------------------------------------------------------
+  # MICROSERVICIO 1: Catálogo y Productos (Puerto 8001)
+  # ----------------------------------------------------------------------------
+  ms-catalogo:
+    build:
+      context: .
+      dockerfile: services/catalogo/Dockerfile
+    container_name: maxiconecta-ms-catalogo
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      - PORT=8001
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - maxiconecta-net
+
+  # ----------------------------------------------------------------------------
+  # MICROSERVICIO 2: Puntos de Venta POS (Puerto 8002)
+  # ----------------------------------------------------------------------------
+  ms-pos:
+    build:
+      context: .
+      dockerfile: services/pos/Dockerfile
+    container_name: maxiconecta-ms-pos
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env
+    environment:
+      - PORT=8002
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - maxiconecta-net
+
+  # ----------------------------------------------------------------------------
+  # MICROSERVICIO 3: Carrito y Checkout (Puerto 8003)
+  # ----------------------------------------------------------------------------
+  ms-carrito:
+    build:
+      context: .
+      dockerfile: services/carrito/Dockerfile
+    container_name: maxiconecta-ms-carrito
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    env_file:
+      - .env
+    environment:
+      - PORT=8003
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - maxiconecta-net
+
+  # ----------------------------------------------------------------------------
+  # MICROSERVICIO 4: Clientes y Fidelización (Puerto 8004)
+  # ----------------------------------------------------------------------------
+  ms-clientes:
+    build:
+      context: .
+      dockerfile: services/clientes/Dockerfile
+    container_name: maxiconecta-ms-clientes
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    env_file:
+      - .env
+    environment:
+      - PORT=8004
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - maxiconecta-net
+
+  # ----------------------------------------------------------------------------
+  # MICROSERVICIO 5: Órdenes y Ventas (Puerto 8005)
+  # ----------------------------------------------------------------------------
+  ms-ordenes:
+    build:
+      context: .
+      dockerfile: services/ordenes/Dockerfile
+    container_name: maxiconecta-ms-ordenes
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    env_file:
+      - .env
+    environment:
+      - PORT=8005
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - maxiconecta-net
+
+  # ----------------------------------------------------------------------------
+  # MICROSERVICIO 6: Reportes y Analítica (Puerto 8006)
+  # ----------------------------------------------------------------------------
+  ms-reportes:
+    build:
+      context: .
+      dockerfile: services/reportes/Dockerfile
+    container_name: maxiconecta-ms-reportes
+    restart: unless-stopped
+    ports:
+      - "8006:8006"
+    env_file:
+      - .env
+    environment:
+      - PORT=8006
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - maxiconecta-net
+
+networks:
+  maxiconecta-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local

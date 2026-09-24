@@ -1,7 +1,7 @@
 from functools import wraps
 from inspect import isawaitable
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, TypeVar
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from backend.shared.config import settings
@@ -26,11 +26,16 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 async def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme)
 ) -> Dict[str, Any]:
     """
     Inyección de dependencias para obtener el usuario autenticado del token Bearer.
     """
+    middleware_user = getattr(request.state, "current_user", None)
+    if middleware_user:
+        return middleware_user
+
     if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

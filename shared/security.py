@@ -5,21 +5,23 @@ from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
-from passlib.context import CryptContext
 from backend.shared.config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security_scheme = HTTPBearer(auto_error=False)
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
 
+def _password_context():
+    from passlib.context import CryptContext
+    return CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verifica si la contraseña plana coincide con el hash almacenado."""
-    return pwd_context.verify(plain_password, hashed_password)
+    return _password_context().verify(plain_password, hashed_password)
 
 def get_password_hash(password: str) -> str:
     """Genera hash seguro para una contraseña."""
-    return pwd_context.hash(password)
+    return _password_context().hash(password)
 
 def create_access_token(
     data: Dict[str, Any],

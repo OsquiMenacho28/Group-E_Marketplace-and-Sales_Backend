@@ -1,9 +1,10 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 from decimal import Decimal
-from fastapi import APIRouter, Query, HTTPException, status
+from fastapi import APIRouter, Depends, Query, HTTPException, status
 from app.schemas import ProductoCreate, ProductoResponse, VarianteResponse, CategoriaResponse
 from backend.shared.erp_clients.inventarios import inventarios_client
+from backend.shared.security import get_current_user, require_jwt_claims
 
 router = APIRouter(prefix="/api/v1/catalogo", tags=["Catálogo"])
 
@@ -64,7 +65,11 @@ async def obtener_producto(id: UUID):
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
 
 @router.post("/productos", response_model=ProductoResponse, status_code=status.HTTP_201_CREATED)
-async def crear_producto(payload: ProductoCreate):
+@require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
+async def crear_producto(
+    payload: ProductoCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """RF-01, RF-05: Crear producto y sus variantes."""
     prod_id = uuid4()
     variantes_res = [

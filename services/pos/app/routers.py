@@ -1,13 +1,14 @@
 import uuid
-from typing import List
+from typing import Any, Dict, List
 from decimal import Decimal
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas import (
     AbrirCajaRequest, CerrarCajaRequest, CajaResponse,
     VentaPOSRequest, VentaPOSResponse, VentaSuspendida
 )
 from backend.shared.erp_clients.pagos import pagos_client
 from backend.shared.erp_clients.inventarios import inventarios_client
+from backend.shared.security import get_current_user, require_jwt_claims
 
 router = APIRouter(prefix="/api/v1/pos", tags=["Punto de Venta"])
 
@@ -15,7 +16,11 @@ _CAJAS_ACTIVAS = {}
 _VENTAS_SUSPENDIDAS = {}
 
 @router.post("/caja/abrir", response_model=CajaResponse, status_code=status.HTTP_201_CREATED)
-async def abrir_caja(payload: AbrirCajaRequest):
+@require_jwt_claims("sub", allowed_roles={"cajero", "administrador"})
+async def abrir_caja(
+    payload: AbrirCajaRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """RF-09: Apertura de turno de caja con fondo inicial."""
     caja_id = uuid.uuid4()
     caja = CajaResponse(
@@ -41,7 +46,11 @@ async def cerrar_caja(caja_id: uuid.UUID, payload: CerrarCajaRequest):
     return caja
 
 @router.post("/ventas/cobrar", response_model=VentaPOSResponse, status_code=status.HTTP_201_CREATED)
-async def procesar_venta_pos(payload: VentaPOSRequest):
+@require_jwt_claims("sub", allowed_roles={"cajero", "administrador"})
+async def procesar_venta_pos(
+    payload: VentaPOSRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """RF-10: Venta presencial rápida y emisión de ticket/factura."""
     caja = _CAJAS_ACTIVAS.get(str(payload.caja_id))
     if not caja or caja.estado != "abierta":

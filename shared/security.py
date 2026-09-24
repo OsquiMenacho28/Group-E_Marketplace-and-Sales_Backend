@@ -1,18 +1,53 @@
+from datetime import datetime, timedelta
 from functools import wraps
 from inspect import isawaitable
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
+from passlib.context import CryptContext
 from backend.shared.config import settings
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security_scheme = HTTPBearer(auto_error=False)
 
 Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
 
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifica si la contraseña plana coincide con el hash almacenado."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """Genera hash seguro para una contraseña."""
+    return pwd_context.hash(password)
+
+def create_access_token(
+    data: Dict[str, Any],
+    expires_delta: Optional[timedelta] = None
+) -> str:
+    """
+    Crea un token JWT de acceso con claims de usuario y rol.
+    """
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=60))
+    to_encode.update({"exp": expire, "type": "access"})
+    return jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+def create_refresh_token(
+    data: Dict[str, Any],
+    expires_delta: Optional[timedelta] = None
+) -> str:
+    """
+    Crea un token JWT de refresco de sesión.
+    """
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(days=7))
+    to_encode.update({"exp": expire, "type": "refresh"})
+    return jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
 def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
     """
-    Decodifica y valida la firma del token JWT emitido por Supabase Auth.
+    Decodifica y valida la firma del token JWT emitido por Supabase Auth o el sistema.
     """
     try:
         payload = jwt.decode(
@@ -62,12 +97,20 @@ async def get_current_user(
     # En Supabase Auth, el rol se almacena en app_metadata o user_metadata
     user_metadata = payload.get("user_metadata", {})
     app_metadata = payload.get("app_metadata", {})
-    role = app_metadata.get("role") or user_metadata.get("role") or payload.get("role", "cliente")
+    role = payload.get("role") or app_metadata.get("role") or user_metadata.get("role") or "cliente"
+    user_id = payload.get("sub") or payload.get("user_id") or payload.get("id")
+    email = payload.get("email")
+    nombre_completo = payload.get("nombre_completo") or user_metadata.get("nombre_completo")
+    sucursal_id = payload.get("sucursal_id") or app_metadata.get("sucursal_id") or user_metadata.get("sucursal_id")
 
     return {
         "user_id": subject,
         "email": payload.get("email"),
+    "user_id": user_id,
+    "email": email,
         "role": role,
+        "nombre_completo": nombre_completo,
+        "sucursal_id": sucursal_id,
         "payload": payload
     }
 

@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import router
+try:
+    from app.routers import router
+except (ModuleNotFoundError, ImportError):
+    from backend.services.clientes.app.routers import router
 from backend.shared.exceptions import MaxiConectaException, maxiconecta_exception_handler
 
 app = FastAPI(

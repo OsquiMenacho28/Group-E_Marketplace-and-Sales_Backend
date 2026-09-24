@@ -1,5 +1,5 @@
 from typing import List, Optional, Dict, Any
-from uuid import UUID, uuid4
+from uuid import UUID
 from decimal import Decimal
 from pydantic import BaseModel, Field
 
@@ -25,13 +25,26 @@ class VarianteResponse(VarianteBase):
     id: UUID
     producto_id: UUID
 
+class ImagenProductoCreate(BaseModel):
+    data_url: str = Field(..., min_length=32, max_length=7_000_000)
+    nombre: Optional[str] = Field(default=None, max_length=160)
+
+class ImagenProductoResponse(BaseModel):
+    id: UUID
+    url: str
+    nombre: Optional[str] = None
+    es_principal: bool = False
+    orden: int = 0
+
 class ProductoCreate(BaseModel):
     sku: str
     nombre: str
     descripcion: Optional[str] = None
     marca: Optional[str] = None
     categoria_id: UUID
+    precio: Decimal = Field(..., ge=0)
     variantes: List[VarianteBase] = []
+    imagenes: List[ImagenProductoCreate] = Field(default_factory=list, max_length=5)
 
 class ProductoResponse(BaseModel):
     id: UUID
@@ -42,3 +55,6 @@ class ProductoResponse(BaseModel):
     categoria_id: UUID
     estado: str = "publicado"
     variantes: List[VarianteResponse] = []
+    precio: Decimal = Field(default=Decimal("0"), ge=0)
+    categorias: Optional[CategoriaResponse] = None
+    imagenes_producto: List[ImagenProductoResponse] = []

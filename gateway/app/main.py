@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 import httpx
 from typing import Any, Dict
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, status
@@ -81,19 +82,29 @@ async def forward_request(target_base_url: str, request: Request) -> Response:
     if query:
         url = f"{url}?{query}"
 
-    headers = dict(request.headers)
-    headers.pop("host", None)
+    headers = {
+        header: request.headers[header]
+        for header in ("authorization", "content-type", "accept")
+        if header in request.headers
+    }
 
-    body = await request.body()
+    request_kwargs: Dict[str, Any] = {
+        "method": request.method,
+        "url": url,
+        "headers": headers,
+    }
+    if request.headers.get("content-type", "").startswith("application/json"):
+        raw_body = await request.body()
+        try:
+            request_kwargs["json"] = json.loads(raw_body.decode("utf-8"))
+        except UnicodeDecodeError:
+            request_kwargs["json"] = json.loads(raw_body.decode("cp1252"))
+    else:
+        request_kwargs["content"] = await request.body()
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body
-            )
+            resp = await client.request(**request_kwargs)
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,

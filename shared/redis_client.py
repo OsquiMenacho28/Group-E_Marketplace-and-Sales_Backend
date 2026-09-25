@@ -66,3 +66,39 @@ async def release_stock_reservation(variante_id: str, reserva_id: str) -> bool:
     key = f"lock:stock:{variante_id}:{reserva_id}"
     deleted = await redis.delete(key)
     return bool(deleted > 0)
+
+# ------------------------------------------------------------------------------
+# Helpers de Caché de Disponibilidad de Stock (RF-07, RIO-INV-01)
+# ------------------------------------------------------------------------------
+# Cachea la respuesta del ERP de Inventarios con un TTL corto (30s por defecto)
+# para mitigar la latencia de red hacia el ERP externo ante consultas repetidas
+# del mismo SKU/sucursal (p. ej. varios clientes viendo el mismo producto).
+#
+# Se degrada de forma segura: si Redis no está disponible (p. ej. en un entorno
+# de desarrollo sin el contenedor levantado), las funciones retornan None/False
+# en lugar de propagar la excepción, y el endpoint que las use debe consultar
+# directamente al ERP como si fuera un "cache miss".
+STOCK_CACHE_TTL_SECONDS = 30
+
+def _stock_cache_key(sku: str, sucursal_id: Optional[str] = None) -> str:
+    return f"stock:{sku}:{sucursal_id or 'general'}"
+
+async def get_stock_cache(sku: str, sucursal_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    try:
+        redis = await get_redis()
+        raw = await redis.get(_stock_cache_key(sku, sucursal_id))
+        if raw:
+            return json.loads(raw)
+        return None
+    except Exception as exc:
+        logger.warning(f"Redis no disponible para lectura de caché de stock ({sku}): {exc}. Se tratará como cache-miss.")
+        return None
+
+async def set_stock_cache(sku: str, data: Dict[str, Any], sucursal_id: Optional[str] = None, ttl_seconds: int = STOCK_CACHE_TTL_SECONDS) -> bool:
+    try:
+        redis = await get_redis()
+        await redis.setex(_stock_cache_key(sku, sucursal_id), ttl_seconds, json.dumps(data, default=str))
+        return True
+    except Exception as exc:
+        logger.warning(f"Redis no disponible para escritura de caché de stock ({sku}): {exc}. Se omite el cacheo.")
+        return False

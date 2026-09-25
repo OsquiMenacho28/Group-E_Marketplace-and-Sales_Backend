@@ -1,3 +1,4 @@
+import uuid
 from typing import Dict, Any, List
 from backend.shared.config import settings
 from backend.shared.erp_clients.base import BaseERPClient
@@ -21,7 +22,8 @@ class InventariosClient(BaseERPClient):
         payload = {"items": items, "ttl_segundos": ttl_segundos}
         res = await self.post("/api/v1/reservas-stock", payload)
         if res.get("status") == "fallback":
-            return {"reserva_id": "res-mock-12345", "status": "CONFIRMADA", "modo": "mock_fallback"}
+            mock_id = f"RES-MOCK-{uuid.uuid4().hex[:6].upper()}"
+            return {"reserva_id": mock_id, "status": "CONFIRMADA", "modo": "mock_fallback"}
         return res
 
     async def descuento_definitivo(self, reserva_id: str, orden_id: str) -> Dict[str, Any]:
@@ -30,6 +32,14 @@ class InventariosClient(BaseERPClient):
         res = await self.post("/api/v1/stock/descuento-definitivo", payload)
         if res.get("status") == "fallback":
             return {"status": "DESCONTADO", "modo": "mock_fallback"}
+        return res
+
+    async def liberar_reserva(self, reserva_id: str, items: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """RIO-INV-02: Liberar reserva temporal de existencias si expira el TTL o se cancela el checkout."""
+        payload = {"reserva_id": reserva_id, "items": items or []}
+        res = await self.post("/api/v1/reservas-stock/liberar", payload)
+        if res.get("status") == "fallback":
+            return {"reserva_id": reserva_id, "status": "LIBERADA", "modo": "mock_fallback"}
         return res
 
     async def reingreso_por_devolucion(self, orden_id: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:

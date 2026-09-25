@@ -3,14 +3,21 @@ from typing import Any, Dict, List
 from datetime import datetime
 from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, status
-from app.schemas import (
-    OrdenCreate, OrdenResponse, ItemOrdenResponse,
-    TransicionEstadoRequest, CotizacionB2BCreate, CotizacionB2BResponse
-)
+try:
+    from app.schemas import (
+        OrdenCreate, OrdenResponse, ItemOrdenResponse,
+        TransicionEstadoRequest, CotizacionB2BCreate, CotizacionB2BResponse
+    )
+except (ModuleNotFoundError, ImportError):
+    from backend.services.ordenes.app.schemas import (
+        OrdenCreate, OrdenResponse, ItemOrdenResponse,
+        TransicionEstadoRequest, CotizacionB2BCreate, CotizacionB2BResponse
+    )
 from backend.shared.erp_clients.inventarios import inventarios_client
 from backend.shared.erp_clients.pagos import pagos_client
 from backend.shared.erp_clients.entregas import entregas_client
 from backend.shared.erp_clients.contabilidad import contabilidad_client
+from backend.shared.redis_client import consultar_reserva, confirmar_reserva_stock
 from backend.shared.security import get_current_user, require_jwt_claims
 
 router = APIRouter(prefix="/api/v1/ordenes", tags=["Órdenes y Ventas"])
@@ -33,8 +40,15 @@ async def crear_orden(payload: OrdenCreate):
     orden_id = uuid.uuid4()
     codigo = f"ORD-{datetime.utcnow().year}-{uuid.uuid4().hex[:6].upper()}"
 
-    # 1. Ejecutar descuento definitivo en Inventarios (RIO-INV-03)
+    # 1. Validar y confirmar reserva en Redis / Inventarios (RF-14 · RIO-INV-02 / RIO-INV-03)
     if payload.reserva_id:
+        reserva = await consultar_reserva(payload.reserva_id)
+        if not reserva or reserva.get("status") == "EXPIRADA":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="La reserva de stock ha expirado o no es válida (límite de 15 minutos superado). Por favor inicie un nuevo checkout."
+            )
+        await confirmar_reserva_stock(payload.reserva_id)
         await inventarios_client.descuento_definitivo(payload.reserva_id, str(orden_id))
 
     # 2. Generar orden de despacho si es a domicilio (RIO-ENT-01)
@@ -42,8 +56,17 @@ async def crear_orden(payload: OrdenCreate):
     if payload.tipo_despacho == "domicilio":
         despacho_res = await entregas_client.solicitar_despacho({
             "orden_id": str(orden_id),
-            "direccion_id": str(payload.direccion_entrega_id),
-            "items": [i.dict() for i in payload.items]
+            "direccion_id": str(payload.direccion_entrega_id) if payload.direccion_entrega_id else None,
+            "items": [
+                {
+                    "variante_id": str(i.variante_id),
+                    "sku": i.sku,
+                    "nombre_producto": i.nombre_producto,
+                    "cantidad": i.cantidad,
+                    "precio_unitario": float(i.precio_unitario)
+                }
+                for i in payload.items
+            ]
         })
         tracking_num = despacho_res.get("guia_despacho")
 

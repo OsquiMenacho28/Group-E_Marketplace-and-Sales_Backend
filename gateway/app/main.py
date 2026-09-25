@@ -42,11 +42,6 @@ app.add_middleware(
             frozenset({"cliente", "cajero", "administrador", "gerente_comercial"}),
             frozenset({"POST", "PATCH", "DELETE"}),
         ),
-        RBACRule(
-            "/api/v1/carrito",
-            frozenset({"cliente", "cajero", "administrador", "gerente_comercial"}),
-            frozenset({"POST", "PUT", "PATCH", "DELETE"}),
-        ),
     ],
 )
 

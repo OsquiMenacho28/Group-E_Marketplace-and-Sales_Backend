@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import redis.asyncio as aioredis
 from backend.shared.config import settings
 
@@ -66,3 +66,62 @@ async def release_stock_reservation(variante_id: str, reserva_id: str) -> bool:
     key = f"lock:stock:{variante_id}:{reserva_id}"
     deleted = await redis.delete(key)
     return bool(deleted > 0)
+
+# ------------------------------------------------------------------------------
+# Ventas suspendidas en POS (RF-12)
+# ------------------------------------------------------------------------------
+
+async def save_suspended_sale(sale_id: str, sale_data: Dict[str, Any]):
+    """
+    Guarda temporalmente una venta suspendida en Redis.
+    """
+    redis = await get_redis()
+    key = f"pos:venta_suspendida:{sale_id}"
+    await redis.set(key, json.dumps(sale_data))
+
+
+async def get_suspended_sale(sale_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Obtiene una venta suspendida por su ID.
+    """
+    redis = await get_redis()
+    key = f"pos:venta_suspendida:{sale_id}"
+    raw = await redis.get(key)
+
+    if not raw:
+        return None
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+async def list_suspended_sales() -> List[Dict[str, Any]]:
+    """
+    Lista todas las ventas actualmente suspendidas.
+    """
+    redis = await get_redis()
+    sales = []
+
+    async for key in redis.scan_iter(match="pos:venta_suspendida:*"):
+        raw = await redis.get(key)
+
+        if raw:
+            try:
+                sales.append(json.loads(raw))
+            except Exception:
+                continue
+
+    return sales
+
+
+async def delete_suspended_sale(sale_id: str) -> bool:
+    """
+    Elimina una venta suspendida de Redis al recuperarla.
+    """
+    redis = await get_redis()
+    key = f"pos:venta_suspendida:{sale_id}"
+    deleted = await redis.delete(key)
+
+    return deleted > 0

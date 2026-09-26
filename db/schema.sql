@@ -5,6 +5,8 @@
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "unaccent";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
 -- ------------------------------------------------------------------------------
 -- ENUMS Y TIPOS DE DATOS
@@ -296,7 +298,26 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 -- Índices de alto rendimiento
 CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos(categoria_id);
 CREATE INDEX IF NOT EXISTS idx_productos_estado ON productos(estado);
+CREATE INDEX IF NOT EXISTS idx_productos_marca ON productos(marca);
 CREATE INDEX IF NOT EXISTS idx_variantes_producto ON variantes(producto_id);
+CREATE INDEX IF NOT EXISTS idx_variantes_precio ON variantes(precio);
 CREATE INDEX IF NOT EXISTS idx_ordenes_cliente ON ordenes(cliente_id);
 CREATE INDEX IF NOT EXISTS idx_ordenes_estado ON ordenes(estado);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+
+-- ------------------------------------------------------------------------------
+-- SOPORTE FULL-TEXT SEARCH (FTS) Y BÚSQUEDA FACETADA (RF-06 / US-06)
+-- ------------------------------------------------------------------------------
+ALTER TABLE productos ADD COLUMN IF NOT EXISTS search_vector tsvector 
+    GENERATED ALWAYS AS (
+        to_tsvector('spanish', 
+            coalesce(nombre, '') || ' ' || 
+            coalesce(marca, '') || ' ' || 
+            coalesce(sku, '') || ' ' || 
+            coalesce(descripcion, '')
+        )
+    ) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_productos_fts_gin ON productos USING GIN (search_vector);
+CREATE INDEX IF NOT EXISTS idx_productos_nombre_trgm ON productos USING GIN (nombre gin_trgm_ops);
+

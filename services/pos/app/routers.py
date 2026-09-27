@@ -9,11 +9,17 @@ from app.schemas import (
 from backend.shared.erp_clients.pagos import pagos_client
 from backend.shared.erp_clients.inventarios import inventarios_client
 from backend.shared.security import get_current_user, require_jwt_claims
+from backend.shared.redis_client import (
+    save_suspended_sale,
+    get_suspended_sale,
+    list_suspended_sales,
+    delete_suspended_sale
+)
 
 router = APIRouter(prefix="/api/v1/pos", tags=["Punto de Venta"])
 
 _CAJAS_ACTIVAS = {}
-_VENTAS_SUSPENDIDAS = {}
+#_VENTAS_SUSPENDIDAS = {}
 
 @router.post("/caja/abrir", response_model=CajaResponse, status_code=status.HTTP_201_CREATED)
 @require_jwt_claims("sub", allowed_roles={"cajero", "administrador"})
@@ -106,20 +112,41 @@ async def procesar_venta_pos(
 @router.post("/ventas/suspender", status_code=status.HTTP_201_CREATED)
 async def suspender_venta(payload: VentaSuspendida):
     """RF-12: Suspender transacción en caja para continuar con la fila."""
-    _VENTAS_SUSPENDIDAS[payload.id] = payload
-    return {"mensaje": "Venta pausada exitosamente", "id": payload.id}
+    await save_suspended_sale(
+        payload.id,
+        payload.model_dump(mode="json")
+    )
+
+    return {
+        "mensaje": "Venta pausada exitosamente",
+        "id": payload.id
+    }
+
 
 @router.get("/ventas/suspendidas", response_model=List[VentaSuspendida])
 async def listar_ventas_suspendidas():
     """RF-12: Recuperar lista de ventas en espera."""
-    return list(_VENTAS_SUSPENDIDAS.values())
+    ventas = await list_suspended_sales()
+
+    return [
+        VentaSuspendida(**venta)
+        for venta in ventas
+    ]
+
 
 @router.delete("/ventas/suspendidas/{id}")
 async def reanudar_venta_suspendida(id: str):
     """RF-12: Reanudar venta y quitar de espera."""
-    if id in _VENTAS_SUSPENDIDAS:
-        return _VENTAS_SUSPENDIDAS.pop(id)
-    raise HTTPException(status_code=404, detail="Venta suspendida no encontrada")
+    venta = await get_suspended_sale(id)
+    if not venta:
+        raise HTTPException(
+            status_code=404,
+            detail="Venta suspendida no encontrada"
+        )
+
+    await delete_suspended_sale(id)
+
+    return venta
 
 @router.post("/pedidos/retiro-sucursal/validar")
 async def validar_retiro_sucursal(codigo_retiro: str):

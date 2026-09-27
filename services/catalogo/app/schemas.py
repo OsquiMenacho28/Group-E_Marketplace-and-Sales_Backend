@@ -42,3 +42,15 @@ class ProductoResponse(BaseModel):
     categoria_id: UUID
     estado: str = "publicado"
     variantes: List[VarianteResponse] = []
+
+class PrecioResolucionResponse(BaseModel):
+    lista_precio_id: UUID
+    lista_nombre: str
+    variante_id: UUID
+    precio: Decimal
+    moneda: str
+    canal: str
+    tipo_cliente: str
+    sucursal_id: Optional[UUID] = None
+    fecha_inicio: str
+    fecha_fin: Optional[str] = None

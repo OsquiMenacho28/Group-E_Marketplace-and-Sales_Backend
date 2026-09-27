@@ -350,17 +350,22 @@ async def list_suspended_sales() -> List[Dict[str, Any]]:
 
 async def delete_suspended_sale(sale_id: str) -> bool:
     """
-    Elimina una venta suspendida de Redis al recuperarla.
+    Elimina una venta suspendida de Redis o de memoria al recuperarla.
     """
     global _redis_unavailable
     key = f"pos:venta_suspendida:{sale_id}"
-    redis = await get_redis()
-    if redis:
+    deleted_redis = False
+    if not _redis_unavailable:
         try:
-            deleted = await redis.delete(key)
-            return deleted > 0
+            redis = await get_redis()
+            if redis:
+                deleted = await redis.delete(key)
+                deleted_redis = deleted > 0
         except Exception:
             _redis_unavailable = True
+
+    deleted_mem = _in_memory_store.pop(key, None) is not None
+    return deleted_redis or deleted_mem
 
 # ------------------------------------------------------------------------------
 # Helpers de Caché de Disponibilidad de Stock (RF-07, RIO-INV-01)
@@ -379,37 +384,43 @@ def _stock_cache_key(sku: str, sucursal_id: Optional[str] = None) -> str:
     return f"stock:{sku}:{sucursal_id or 'general'}"
 
 async def get_stock_cache(sku: str, sucursal_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    try:
-        redis = await get_redis()
-        if redis:
-            raw = await redis.get(_stock_cache_key(sku, sucursal_id))
-            if raw:
-                return json.loads(raw)
-        key = _stock_cache_key(sku, sucursal_id)
-        if key in _in_memory_store:
-            entry = _in_memory_store[key]
-            if entry.get("expires_at", 0) > time.time():
-                return json.loads(entry["value"])
-            else:
-                _in_memory_store.pop(key, None)
-        return None
-    except Exception as exc:
-        logger.warning(f"Redis no disponible para lectura de caché de stock ({sku}): {exc}. Se tratará como cache-miss.")
-        return None
+    global _redis_unavailable
+    key = _stock_cache_key(sku, sucursal_id)
+    if not _redis_unavailable:
+        try:
+            redis = await get_redis()
+            if redis:
+                raw = await redis.get(key)
+                if raw:
+                    return json.loads(raw)
+        except Exception as exc:
+            _redis_unavailable = True
+            logger.warning(f"Redis no disponible para lectura de caché de stock ({sku}): {exc}. Se usará almacén en memoria.")
+
+    if key in _in_memory_store:
+        entry = _in_memory_store[key]
+        if entry.get("expires_at", 0) > time.time():
+            return json.loads(entry["value"])
+        else:
+            _in_memory_store.pop(key, None)
+    return None
 
 async def set_stock_cache(sku: str, data: Dict[str, Any], sucursal_id: Optional[str] = None, ttl_seconds: int = STOCK_CACHE_TTL_SECONDS) -> bool:
-    try:
-        key = _stock_cache_key(sku, sucursal_id)
-        payload = json.dumps(data, default=str)
-        redis = await get_redis()
-        if redis:
-            await redis.setex(key, ttl_seconds, payload)
-            return True
-        _in_memory_store[key] = {
-            "value": payload,
-            "expires_at": time.time() + ttl_seconds
-        }
-        return True
-    except Exception as exc:
-        logger.warning(f"Redis no disponible para escritura de caché de stock ({sku}): {exc}. Se omite el cacheo.")
-        return False
+    global _redis_unavailable
+    key = _stock_cache_key(sku, sucursal_id)
+    payload = json.dumps(data, default=str)
+    if not _redis_unavailable:
+        try:
+            redis = await get_redis()
+            if redis:
+                await redis.set(key, payload, ex=ttl_seconds)
+                return True
+        except Exception as exc:
+            _redis_unavailable = True
+            logger.warning(f"Redis no disponible para escritura de caché de stock ({sku}): {exc}. Se usará almacén en memoria.")
+
+    _in_memory_store[key] = {
+        "value": payload,
+        "expires_at": time.time() + ttl_seconds
+    }
+    return True

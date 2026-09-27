@@ -2,10 +2,16 @@ import uuid
 from typing import Any, Dict, List
 from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, status
-from app.schemas import (
-    AbrirCajaRequest, CerrarCajaRequest, CajaResponse,
-    VentaPOSRequest, VentaPOSResponse, VentaSuspendida
-)
+try:
+    from app.schemas import (
+        AbrirCajaRequest, CerrarCajaRequest, CajaResponse,
+        VentaPOSRequest, VentaPOSResponse, VentaSuspendida
+    )
+except (ModuleNotFoundError, ImportError):
+    from backend.services.pos.app.schemas import (
+        AbrirCajaRequest, CerrarCajaRequest, CajaResponse,
+        VentaPOSRequest, VentaPOSResponse, VentaSuspendida
+    )
 from backend.shared.erp_clients.pagos import pagos_client
 from backend.shared.erp_clients.inventarios import inventarios_client
 from backend.shared.security import get_current_user, require_jwt_claims

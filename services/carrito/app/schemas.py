@@ -5,11 +5,14 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 class ItemCarritoAdd(BaseModel):
-    variante_id: UUID
+    variante_id: str = Field(..., min_length=1, max_length=120)
     sku: str
     nombre: str
     cantidad: int = Field(..., gt=0)
     precio_unitario: Decimal = Field(..., ge=0)
+
+class ItemCarritoUpdate(BaseModel):
+    cantidad: int = Field(..., gt=0)
 
 class ItemCarritoResponse(ItemCarritoAdd):
     total_linea: Decimal

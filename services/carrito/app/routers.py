@@ -5,14 +5,14 @@ from fastapi import APIRouter, HTTPException, status
 from typing import List
 try:
     from app.schemas import (
-        ItemCarritoAdd, ItemCarritoResponse, CarritoResponse,
+        ItemCarritoAdd, ItemCarritoResponse, ItemCarritoUpdate, CarritoResponse,
         AplicarCuponRequest, CheckoutInitRequest, CheckoutInitResponse,
         ReservaConsultaResponse, CancelarReservaResponse,
         WishlistAdd, WishlistResponse
     )
 except (ModuleNotFoundError, ImportError):
     from backend.services.carrito.app.schemas import (
-        ItemCarritoAdd, ItemCarritoResponse, CarritoResponse,
+        ItemCarritoAdd, ItemCarritoResponse, ItemCarritoUpdate, CarritoResponse,
         AplicarCuponRequest, CheckoutInitRequest, CheckoutInitResponse,
         ReservaConsultaResponse, CancelarReservaResponse,
         WishlistAdd, WishlistResponse
@@ -93,6 +93,17 @@ async def remover_item_carrito(identificador: str, variante_id: str):
     await save_cart_to_cache(identificador, raw)
     return await ver_carrito(identificador)
 
+@router.put("/{identificador}/items/{variante_id}", response_model=CarritoResponse)
+async def actualizar_cantidad_item(identificador: str, variante_id: str, payload: ItemCarritoUpdate):
+    """Actualiza una cantidad persistida en Redis."""
+    raw = await get_cart_from_cache(identificador)
+    item = next((entry for entry in raw.get("items", []) if entry["variante_id"] == variante_id), None)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El ítem no existe en el carrito")
+    item["cantidad"] = payload.cantidad
+    await save_cart_to_cache(identificador, raw)
+    return await ver_carrito(identificador)
+
 @router.post("/{identificador}/cupon", response_model=CarritoResponse)
 async def aplicar_cupon(identificador: str, payload: AplicarCuponRequest):
     """RF-17: Validar y aplicar cupón de descuento."""
@@ -101,8 +112,9 @@ async def aplicar_cupon(identificador: str, payload: AplicarCuponRequest):
         raise HTTPException(status_code=400, detail="Cupón no válido o vencido")
 
     raw = await get_cart_from_cache(identificador)
+    subtotal = sum(Decimal(str(item["cantidad"])) * Decimal(str(item["precio_unitario"])) for item in raw.get("items", []))
     raw["cupon"] = codigo
-    raw["descuento"] = float(_CUPONES_VALIDOS[codigo])
+    raw["descuento"] = float(subtotal * Decimal("0.10")) if codigo == "MAXI10" else float(_CUPONES_VALIDOS[codigo])
     await save_cart_to_cache(identificador, raw)
     return await ver_carrito(identificador)
 

@@ -1,11 +1,14 @@
 import os
 import logging
+import json
 import httpx
+from typing import Any, Dict
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from backend.shared.config import settings
-from backend.shared.security import get_current_user, require_role, decode_access_token
+from backend.shared.rbac import RBACAuthorizationMiddleware, RBACRule
+from backend.shared.security import require_role
 from backend.shared.exceptions import MaxiConectaException, maxiconecta_exception_handler
 
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +26,29 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+app.add_middleware(
+    RBACAuthorizationMiddleware,
+    rules=[
+        RBACRule("/api/v1/pos", frozenset({"cajero", "administrador"})),
+        RBACRule("/api/v1/reportes", frozenset({"administrador", "gerente_comercial"})),
+        RBACRule(
+            "/api/v1/catalogo",
+            frozenset({"administrador", "gerente_comercial"}),
+            frozenset({"POST", "PUT", "PATCH", "DELETE"}),
+        ),
+        RBACRule(
+            "/api/v1/ordenes",
+            frozenset({"cliente", "cajero", "administrador", "gerente_comercial"}),
+            frozenset({"POST", "PATCH", "DELETE"}),
+        ),
+        RBACRule(
+            "/api/v1/carrito",
+            frozenset({"cliente", "cajero", "administrador", "gerente_comercial"}),
+            frozenset({"POST", "PUT", "PATCH", "DELETE"}),
+        ),
+    ],
 )
 
 app.add_exception_handler(MaxiConectaException, maxiconecta_exception_handler)
@@ -57,8 +83,11 @@ async def forward_request(target_base_url: str, request: Request) -> Response:
     if query:
         url = f"{url}?{query}"
 
-    headers = dict(request.headers)
-    headers.pop("host", None)
+    headers = {
+        header: request.headers[header]
+        for header in ("authorization", "content-type", "accept")
+        if header in request.headers
+    }
 
     # Los endpoints de streaming (Server-Sent Events, p. ej. el notificador de
     # sincronización de catálogo RF-08) nunca "terminan" su respuesta, por lo
@@ -68,16 +97,23 @@ async def forward_request(target_base_url: str, request: Request) -> Response:
     if path.rstrip("/").endswith("sync-events"):
         return await _forward_streaming(url, request, headers)
 
-    body = await request.body()
+    request_kwargs: Dict[str, Any] = {
+        "method": request.method,
+        "url": url,
+        "headers": headers,
+    }
+    if request.headers.get("content-type", "").startswith("application/json"):
+        raw_body = await request.body()
+        try:
+            request_kwargs["json"] = json.loads(raw_body.decode("utf-8"))
+        except UnicodeDecodeError:
+            request_kwargs["json"] = json.loads(raw_body.decode("cp1252"))
+    else:
+        request_kwargs["content"] = await request.body()
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body
-            )
+            resp = await client.request(**request_kwargs)
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
@@ -128,8 +164,11 @@ async def proxy_catalogo(path: str, request: Request):
     return await forward_request(settings.MS_CATALOGO_URL, request)
 
 @app.api_route("/api/v1/pos/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], tags=["Punto de Venta"])
-async def proxy_pos(path: str, request: Request):
-    # Opcional: verificación de token para cajero
+async def proxy_pos(
+    path: str,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_role(["cajero", "administrador"])),
+):
     return await forward_request(settings.MS_POS_URL, request)
 
 @app.api_route("/api/v1/carrito/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], tags=["Carrito y Checkout"])
@@ -145,5 +184,9 @@ async def proxy_ordenes(path: str, request: Request):
     return await forward_request(settings.MS_ORDENES_URL, request)
 
 @app.api_route("/api/v1/reportes/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], tags=["Reportes y Analítica"])
-async def proxy_reportes(path: str, request: Request):
+async def proxy_reportes(
+    path: str,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_role(["administrador", "gerente_comercial"])),
+):
     return await forward_request(settings.MS_REPORTES_URL, request)

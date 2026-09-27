@@ -1,6 +1,7 @@
 from typing import List, Optional
 from uuid import UUID
 from decimal import Decimal
+from datetime import datetime
 from pydantic import BaseModel, Field
 
 class ItemCarritoAdd(BaseModel):
@@ -36,3 +37,13 @@ class CheckoutInitResponse(BaseModel):
     monto_total: Decimal
     metodo_pago: str
     status: str = "RESERVA_CONFIRMADA"
+
+class WishlistAdd(BaseModel):
+    variante_id: UUID
+
+
+class WishlistResponse(BaseModel):
+    id: UUID
+    cliente_id: UUID
+    variante_id: UUID
+    created_at: datetime

@@ -1,8 +1,8 @@
 import uuid
-from typing import List
+from typing import Any, Dict, List
 from datetime import datetime
 from decimal import Decimal
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas import (
     OrdenCreate, OrdenResponse, ItemOrdenResponse,
     TransicionEstadoRequest, CotizacionB2BCreate, CotizacionB2BResponse
@@ -11,6 +11,7 @@ from backend.shared.erp_clients.inventarios import inventarios_client
 from backend.shared.erp_clients.pagos import pagos_client
 from backend.shared.erp_clients.entregas import entregas_client
 from backend.shared.erp_clients.contabilidad import contabilidad_client
+from backend.shared.security import get_current_user, require_jwt_claims
 
 router = APIRouter(prefix="/api/v1/ordenes", tags=["Órdenes y Ventas"])
 
@@ -90,7 +91,12 @@ async def obtener_orden(id: uuid.UUID):
     raise HTTPException(status_code=404, detail="Orden no encontrada")
 
 @router.patch("/{id}/estado", response_model=OrdenResponse)
-async def cambiar_estado_orden(id: uuid.UUID, payload: TransicionEstadoRequest):
+@require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial", "cajero"})
+async def cambiar_estado_orden(
+    id: uuid.UUID,
+    payload: TransicionEstadoRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """RF-28: Máquina de estados de la orden."""
     oid = str(id)
     if oid not in _ORDENES_DB:
@@ -156,7 +162,11 @@ async def crear_cotizacion(payload: CotizacionB2BCreate):
     return cotizacion
 
 @router.post("/cotizaciones/{id}/aprobar", response_model=CotizacionB2BResponse)
-async def aprobar_cotizacion(id: uuid.UUID):
+@require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
+async def aprobar_cotizacion(
+    id: uuid.UUID,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """RF-35: Aprobación jerárquica de cotización B2B."""
     cid = str(id)
     if cid not in _COTIZACIONES_DB:

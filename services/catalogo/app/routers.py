@@ -387,7 +387,7 @@ async def buscar_productos_facetados(
     precio_min: Optional[Decimal] = Query(None, ge=0, description="Precio mínimo en BOB"),
     precio_max: Optional[Decimal] = Query(None, ge=0, description="Precio máximo en BOB"),
     en_stock: Optional[bool] = Query(None, description="Filtrar únicamente productos con stock > 0"),
-    ordenar_por: str = Query("relevancia", regex="^(relevancia|precio_asc|precio_desc|nombre)$"),
+    ordenar_por: str = Query("relevancia", pattern="^(relevancia|precio_asc|precio_desc|nombre)$"),
     pagina: int = Query(1, ge=1),
     limite: int = Query(20, ge=1, le=100),
 ):

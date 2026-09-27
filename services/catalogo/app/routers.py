@@ -1,11 +1,17 @@
+import asyncio
 import base64
 import binascii
+import json as _json
 import logging
 import re
 import unicodedata
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
@@ -14,6 +20,7 @@ try:
         CategoriaResponse,
         ProductoCreate,
         ProductoResponse,
+        ProductoUpdate,
         VarianteResponse,
         ImagenProductoResponse,
         FacetItem,
@@ -21,12 +28,19 @@ try:
         FacetasCatalogo,
         BusquedaFacetadaResponse,
         SugerenciaItem,
+        SyncCatalogoItem,
+        SyncCatalogoResponse,
+        StockDisponibilidadResponse,
+        StockSucursal,
+        ProductoStockResumen,
+        BusquedaStockResponse,
     )
 except (ModuleNotFoundError, ImportError):
     from backend.services.catalogo.app.schemas import (
         CategoriaResponse,
         ProductoCreate,
         ProductoResponse,
+        ProductoUpdate,
         VarianteResponse,
         ImagenProductoResponse,
         FacetItem,
@@ -34,10 +48,17 @@ except (ModuleNotFoundError, ImportError):
         FacetasCatalogo,
         BusquedaFacetadaResponse,
         SugerenciaItem,
+        SyncCatalogoItem,
+        SyncCatalogoResponse,
+        StockDisponibilidadResponse,
+        StockSucursal,
+        ProductoStockResumen,
+        BusquedaStockResponse,
     )
 
 from backend.shared.database import get_supabase_admin_client
 from backend.shared.erp_clients.inventarios import inventarios_client
+from backend.shared.redis_client import get_stock_cache, set_stock_cache, STOCK_CACHE_TTL_SECONDS
 from backend.shared.security import get_current_user, require_jwt_claims
 
 logger = logging.getLogger("maxiconecta.catalogo")
@@ -389,6 +410,26 @@ def _ensure_bucket(client: Any) -> None:
 
 
 # ------------------------------------------------------------------------------
+# RF-08: Suscriptores en memoria para el notificador SSE de cambios de catálogo.
+# Cada terminal POS conectada mantiene una cola propia; al mutar un producto se
+# difunde el evento a todas las colas activas (broadcast simple in-process).
+# ------------------------------------------------------------------------------
+_SYNC_SUBSCRIBERS: List["asyncio.Queue[Dict[str, Any]]"] = []
+
+async def _broadcast_catalogo_event(evento: Dict[str, Any]) -> None:
+    evento_completo = {**evento, "emitido_en": datetime.now(timezone.utc).isoformat()}
+    for cola in list(_SYNC_SUBSCRIBERS):
+        await cola.put(evento_completo)
+
+# ------------------------------------------------------------------------------
+# Consulta Rápida de Stock Multi-Sucursal (Modal F3): caché de lectura en
+# memoria de muy corta duración para optimizar búsquedas repetidas del mismo
+# término mientras el cajero/administrador escribe.
+# ------------------------------------------------------------------------------
+_STOCK_MULTISUCURSAL_CACHE: Dict[str, Dict[str, Any]] = {}
+_STOCK_MULTISUCURSAL_CACHE_TTL = 15  # segundos
+
+# ------------------------------------------------------------------------------
 # 1. CATEGORÍAS
 # ------------------------------------------------------------------------------
 @router.get("/categorias", response_model=List[CategoriaResponse])
@@ -726,6 +767,50 @@ async def listar_productos(
     return results
 
 
+@router.get("/productos/buscar-stock", response_model=BusquedaStockResponse)
+async def buscar_stock_multisucursal(
+    q: str = Query(..., min_length=1, description="SKU o nombre de producto a buscar")
+):
+    """
+    [INT] Consulta de disponibilidad multi-sucursal con caché de lectura
+    optimizada (SIMULA INTEGRACIÓN por el momento vía InventariosClient).
+    [BE] Búsqueda rápida de producto por SKU/nombre y desglose por sucursal,
+    usada por el modal de consulta rápida (atajo F3) en el POS.
+    """
+    q_norm = q.strip().lower()
+    ahora = datetime.now(timezone.utc).timestamp()
+
+    cacheado = _STOCK_MULTISUCURSAL_CACHE.get(q_norm)
+    if cacheado and (ahora - cacheado["ts"]) < _STOCK_MULTISUCURSAL_CACHE_TTL:
+        return BusquedaStockResponse(**cacheado["data"], origen_cache=True)
+
+    client = _get_supabase_client_safe()
+    universo = _fetch_all_products(client)
+    coincidencias = [
+        p for p in universo
+        if q_norm in p.nombre.lower()
+        or q_norm in p.sku.lower()
+        or any(q_norm in v.sku.lower() for v in p.variantes)
+    ]
+
+    resultados: List[ProductoStockResumen] = []
+    for p in coincidencias:
+        sku_ref = p.variantes[0].sku if p.variantes else p.sku
+        data = await inventarios_client.consultar_disponibilidad_multisucursal(sku_ref)
+        sucursales = [StockSucursal(**s) for s in data.get("sucursales", [])]
+        resultados.append(ProductoStockResumen(
+            producto_id=p.id,
+            sku=sku_ref,
+            nombre=p.nombre,
+            stock_total=sum(s.stock_disponible for s in sucursales),
+            sucursales=sucursales,
+        ))
+
+    respuesta = {"query": q, "resultados": [r.model_dump() for r in resultados]}
+    _STOCK_MULTISUCURSAL_CACHE[q_norm] = {"ts": ahora, "data": respuesta}
+    return BusquedaStockResponse(**respuesta, origen_cache=False)
+
+
 @router.get("/productos/{product_id}", response_model=ProductoResponse)
 async def obtener_producto(product_id: UUID):
     client = _get_supabase_client_safe()
@@ -820,9 +905,192 @@ async def crear_producto(
             ).execute()
 
     created = client.table("productos").select("*").eq("id", product_id).single().execute()
-    return _product_response_from_db(client, created.data)
+    res = _product_response_from_db(client, created.data)
+    await _broadcast_catalogo_event({
+        "tipo": "producto_creado",
+        "producto_id": str(res.id),
+        "sku": res.sku,
+        "nombre": res.nombre,
+        "precio": float(res.precio) if res.precio else None,
+        "estado": res.estado,
+        "updated_at": res.updated_at.isoformat(),
+    })
+    return res
 
+@router.patch("/productos/{id}", response_model=ProductoResponse)
+async def actualizar_producto(id: UUID, payload: ProductoUpdate):
+    """
+    RF-08: Actualiza datos/precio de un producto y dispara el evento de
+    sincronización multicanal (notificador SSE) hacia las terminales POS
+    conectadas, para mantener consistencia de datos y precios entre canales.
+    """
+    client = _get_supabase_client_safe()
+    if client:
+        update_data = {}
+        if payload.nombre is not None:
+            update_data["nombre"] = payload.nombre
+        if payload.descripcion is not None:
+            update_data["descripcion"] = payload.descripcion
+        if payload.marca is not None:
+            update_data["marca"] = payload.marca
+        if payload.estado is not None:
+            update_data["estado"] = payload.estado
+        
+        if update_data:
+            client.table("productos").update(update_data).eq("id", str(id)).execute()
 
-@router.get("/stock/{sku}")
+        if payload.precio is not None:
+            var_row = client.table("variantes").select("id").eq("producto_id", str(id)).order("created_at").limit(1).execute()
+            if var_row.data:
+                client.table("variantes").update({"precio": float(payload.precio)}).eq("id", var_row.data[0]["id"]).execute()
+
+        prod_res = client.table("productos").select("*, categorias(*), variantes(*), imagenes_producto(*)").eq("id", str(id)).limit(1).execute()
+        if prod_res.data:
+            resp = _product_response_from_db(client, prod_res.data[0])
+            await _broadcast_catalogo_event({
+                "tipo": "producto_actualizado",
+                "producto_id": str(resp.id),
+                "sku": resp.sku,
+                "nombre": resp.nombre,
+                "precio": float(resp.precio) if resp.precio else None,
+                "estado": resp.estado,
+                "updated_at": resp.updated_at.isoformat(),
+            })
+            return resp
+
+    if id in _LOCAL_PRODUCTOS:
+        p = _LOCAL_PRODUCTOS[id]
+        if payload.nombre is not None:
+            p["nombre"] = payload.nombre
+        if payload.descripcion is not None:
+            p["descripcion"] = payload.descripcion
+        if payload.marca is not None:
+            p["marca"] = payload.marca
+        if payload.estado is not None:
+            p["estado"] = payload.estado
+        if payload.precio is not None:
+            p["precio"] = payload.precio
+
+        resp = _build_product_response(p)
+        await _broadcast_catalogo_event({
+            "tipo": "producto_actualizado",
+            "producto_id": str(resp.id),
+            "sku": resp.sku,
+            "nombre": resp.nombre,
+            "precio": float(resp.precio) if resp.precio else None,
+            "estado": resp.estado,
+            "updated_at": resp.updated_at.isoformat(),
+        })
+        return resp
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+
+# ==============================================================================
+# RF-08 — SINCRONIZACIÓN MULTICANAL (WEB <-> POS)
+# ==============================================================================
+
+@router.get("/sync-catalogo", response_model=SyncCatalogoResponse)
+async def sync_catalogo_delta(
+    since: Optional[datetime] = Query(
+        None, description="Timestamp ISO 8601 de la última sincronización local (se devuelven cambios con updated_at posterior)"
+    ),
+    cursor: Optional[str] = Query(None, description="Cursor de paginación devuelto por la página anterior"),
+    page_size: int = Query(20, ge=1, le=100, description="Tamaño de página para la sincronización por lotes"),
+):
+    """
+    RF-08 [BE]: Endpoint delta de sincronización de catálogo con paginación por
+    timestamp `updated_at`. Las terminales POS (o cualquier otro canal) llaman
+    a este endpoint pasando la fecha de su última sincronización exitosa (`since`)
+    y reciben únicamente los productos creados/modificados después de esa fecha,
+    en páginas de `page_size` elementos ordenadas ascendentemente.
+    """
+    client = _get_supabase_client_safe()
+    universo = _fetch_all_products(client)
+    candidatos = sorted(universo, key=lambda p: p.updated_at)
+
+    if since is not None:
+        since_utc = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+        candidatos = [p for p in candidatos if p.updated_at > since_utc]
+
+    offset = int(cursor) if cursor and cursor.isdigit() else 0
+    pagina = candidatos[offset: offset + page_size]
+    hay_mas = (offset + page_size) < len(candidatos)
+    siguiente_cursor = str(offset + page_size) if hay_mas else None
+
+    items = [
+        SyncCatalogoItem(
+            id=p.id,
+            sku=p.sku,
+            nombre=p.nombre,
+            precio_referencia=p.precio or Decimal("0"),
+            estado=p.estado,
+            updated_at=p.updated_at,
+            accion="baja" if p.estado == "descontinuado" else "upsert",
+        )
+        for p in pagina
+    ]
+
+    return SyncCatalogoResponse(
+        items=items,
+        cursor_siguiente=siguiente_cursor,
+        hay_mas=hay_mas,
+        servidor_timestamp=datetime.now(timezone.utc),
+    )
+
+@router.get("/sync-events")
+async def sync_events_stream():
+    """
+    RF-08 [BE]: Notificador de cambios de catálogo hacia terminales POS
+    conectadas, mediante Server-Sent Events (SSE). Cada terminal abre una
+    conexión persistente a este endpoint y recibe en tiempo real los eventos
+    `catalogo-actualizado` emitidos por `crear_producto`/`actualizar_producto`,
+    sin necesidad de hacer polling constante al endpoint de sincronización.
+    """
+    cola: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+    _SYNC_SUBSCRIBERS.append(cola)
+    logger.info(f"Nueva terminal POS suscrita a sync-events (total activas: {len(_SYNC_SUBSCRIBERS)})")
+
+    async def event_generator():
+        try:
+            yield f"event: connected\ndata: {_json.dumps({'mensaje': 'Suscrito a cambios de catálogo en tiempo real'})}\n\n"
+            while True:
+                evento = await cola.get()
+                yield f"event: catalogo-actualizado\ndata: {_json.dumps(evento, default=str)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if cola in _SYNC_SUBSCRIBERS:
+                _SYNC_SUBSCRIBERS.remove(cola)
+            logger.info(f"Terminal POS desconectada de sync-events (total activas: {len(_SYNC_SUBSCRIBERS)})")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+# ==============================================================================
+# RF-07 — DISPONIBILIDAD DE STOCK EN TIEMPO REAL (RIO-INV-01 + CACHÉ REDIS)
+# ==============================================================================
+
+@router.get("/stock/{sku}", response_model=StockDisponibilidadResponse)
 async def consultar_stock(sku: str, sucursal_id: Optional[str] = None):
-    return await inventarios_client.consultar_disponibilidad(sku, sucursal_id)
+    """
+    RF-07: Consulta la disponibilidad de stock en tiempo real vía RIO-INV-01.
+    Antes de llamar al ERP de Inventarios, intenta resolver desde una caché en
+    Redis con TTL corto (30s por defecto) para mitigar la latencia del ERP
+    externo ante consultas repetidas del mismo SKU/sucursal.
+    """
+    cacheado = await get_stock_cache(sku, sucursal_id)
+    if cacheado is not None:
+        return StockDisponibilidadResponse(**cacheado, origen="cache")
+
+    data = await inventarios_client.consultar_disponibilidad(sku, sucursal_id)
+    resultado = {
+        "sku": sku,
+        "sucursal_id": sucursal_id,
+        "stock_disponible": int(data.get("stock_disponible", 0)),
+        "modo": data.get("modo"),
+    }
+    await set_stock_cache(sku, resultado, sucursal_id=sucursal_id, ttl_seconds=STOCK_CACHE_TTL_SECONDS)
+    return StockDisponibilidadResponse(**resultado, origen="erp")

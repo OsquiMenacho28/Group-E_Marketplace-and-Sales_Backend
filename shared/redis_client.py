@@ -130,7 +130,6 @@ async def release_stock_reservation(variante_id: str, reserva_id: str) -> bool:
     deleted = 1 if key in _in_memory_store else 0
     _in_memory_store.pop(key, None)
     return bool(deleted > 0)
-
 async def crear_reserva_stock(
     reserva_id: str,
     cliente_id: str,
@@ -363,6 +362,54 @@ async def delete_suspended_sale(sale_id: str) -> bool:
         except Exception:
             _redis_unavailable = True
 
-    deleted = 1 if key in _in_memory_store else 0
-    _in_memory_store.pop(key, None)
-    return deleted > 0
+# ------------------------------------------------------------------------------
+# Helpers de Caché de Disponibilidad de Stock (RF-07, RIO-INV-01)
+# ------------------------------------------------------------------------------
+# Cachea la respuesta del ERP de Inventarios con un TTL corto (30s por defecto)
+# para mitigar la latencia de red hacia el ERP externo ante consultas repetidas
+# del mismo SKU/sucursal (p. ej. varios clientes viendo el mismo producto).
+#
+# Se degrada de forma segura: si Redis no está disponible (p. ej. en un entorno
+# de desarrollo sin el contenedor levantado), las funciones retornan None/False
+# en lugar de propagar la excepción, y el endpoint que las use debe consultar
+# directamente al ERP como si fuera un "cache miss".
+STOCK_CACHE_TTL_SECONDS = 30
+
+def _stock_cache_key(sku: str, sucursal_id: Optional[str] = None) -> str:
+    return f"stock:{sku}:{sucursal_id or 'general'}"
+
+async def get_stock_cache(sku: str, sucursal_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    try:
+        redis = await get_redis()
+        if redis:
+            raw = await redis.get(_stock_cache_key(sku, sucursal_id))
+            if raw:
+                return json.loads(raw)
+        key = _stock_cache_key(sku, sucursal_id)
+        if key in _in_memory_store:
+            entry = _in_memory_store[key]
+            if entry.get("expires_at", 0) > time.time():
+                return json.loads(entry["value"])
+            else:
+                _in_memory_store.pop(key, None)
+        return None
+    except Exception as exc:
+        logger.warning(f"Redis no disponible para lectura de caché de stock ({sku}): {exc}. Se tratará como cache-miss.")
+        return None
+
+async def set_stock_cache(sku: str, data: Dict[str, Any], sucursal_id: Optional[str] = None, ttl_seconds: int = STOCK_CACHE_TTL_SECONDS) -> bool:
+    try:
+        key = _stock_cache_key(sku, sucursal_id)
+        payload = json.dumps(data, default=str)
+        redis = await get_redis()
+        if redis:
+            await redis.setex(key, ttl_seconds, payload)
+            return True
+        _in_memory_store[key] = {
+            "value": payload,
+            "expires_at": time.time() + ttl_seconds
+        }
+        return True
+    except Exception as exc:
+        logger.warning(f"Redis no disponible para escritura de caché de stock ({sku}): {exc}. Se omite el cacheo.")
+        return False

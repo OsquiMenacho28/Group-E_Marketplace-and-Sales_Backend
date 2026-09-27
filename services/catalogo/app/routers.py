@@ -299,6 +299,27 @@ def _build_product_response(row: Dict[str, Any], cat_dict: Optional[Dict[str, An
 
 
 def _product_response_from_db(client: Any, row: Dict[str, Any]) -> ProductoResponse:
+    # 1. Si la fila ya trae sus relaciones unificadas mediante JOIN (select("*, categorias(*), variantes(*), imagenes_producto(*)")):
+    if "variantes" in row and "categorias" in row:
+        try:
+            variants = row.get("variantes") or []
+            primary_variant = variants[0] if variants else {}
+            cat_data = _category_value(row.get("categorias"))
+            images = row.get("imagenes_producto") or []
+            return ProductoResponse.model_validate(
+                {
+                    **row,
+                    "precio": primary_variant.get("precio", row.get("precio", 0)),
+                    "stock": row.get("stock", 10),
+                    "categorias": cat_data,
+                    "variantes": variants,
+                    "imagenes_producto": images,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Aviso al validar fila unificada de DB: {e}")
+
+    # 2. Fallback individual si no vinieron embebidas
     try:
         category_result = client.table("categorias").select("id,nombre,descripcion,padre_id,atributos_dinamicos,activo").eq("id", str(row["categoria_id"])).limit(1).execute()
         variants = client.table("variantes").select("*").eq("producto_id", str(row["id"])).order("created_at").execute().data
@@ -317,6 +338,26 @@ def _product_response_from_db(client: Any, row: Dict[str, Any]) -> ProductoRespo
     except Exception as e:
         logger.warning(f"Error procesando producto desde DB, usando mapeo local: {e}")
         return _build_product_response(row)
+
+
+def _fetch_all_products(client: Optional[Any] = None, q: Optional[str] = None) -> List[ProductoResponse]:
+    """Recupera el universo de productos en una sola consulta relacional (0 problemas N+1) y FTS en PostgreSQL."""
+    if client:
+        try:
+            db_query = client.table("productos").select("*, categorias(*), variantes(*), imagenes_producto(*)").eq("estado", "publicado")
+            if q and q.strip():
+                try:
+                    # Intento de FTS nativo aprovechando el vector search_vector e índice GIN
+                    db_query = db_query.text_search("search_vector", q.strip(), options={"type": "plain", "config": "spanish"})
+                except Exception:
+                    pass
+            rows = db_query.execute().data or []
+            if rows:
+                return [_product_response_from_db(client, r) for r in rows]
+        except Exception as e:
+            logger.warning(f"Error consultando productos de Supabase: {e}. Usando catálogo local.")
+
+    return [_build_product_response(p) for p in _LOCAL_PRODUCTOS.values()]
 
 
 def _decode_image(data_url: str) -> tuple[str, bytes]:
@@ -397,21 +438,9 @@ async def buscar_productos_facetados(
     - Filtros combinables: categorías múltiples, marcas, rangos de precio y stock.
     - Agregación y recuento dinámico de coincidencias por faceta (counts).
     """
-    # 1. Obtener universo de productos (de Supabase o fallback local)
-    all_products: List[ProductoResponse] = []
+    # 1. Obtener universo de productos (de Supabase mediante JOIN relacional y FTS o fallback local)
     client = _get_supabase_client_safe()
-
-    if client:
-        try:
-            db_query = client.table("productos").select("*").eq("estado", "publicado")
-            rows = db_query.execute().data or []
-            if rows:
-                all_products = [_product_response_from_db(client, r) for r in rows]
-        except Exception as e:
-            logger.warning(f"Error consultando productos de Supabase: {e}. Usando catálogo local.")
-
-    if not all_products:
-        all_products = [_build_product_response(p) for p in _LOCAL_PRODUCTOS.values()]
+    all_products: List[ProductoResponse] = _fetch_all_products(client, q)
 
     # Parsear filtros de lista
     cat_filter_set = set(categoria_ids.split(",")) if categoria_ids else set()
@@ -570,17 +599,7 @@ async def obtener_sugerencias(
         return []
 
     client = _get_supabase_client_safe()
-    all_products: List[ProductoResponse] = []
-    if client:
-        try:
-            rows = client.table("productos").select("*").eq("estado", "publicado").limit(50).execute().data or []
-            if rows:
-                all_products = [_product_response_from_db(client, r) for r in rows]
-        except Exception:
-            pass
-
-    if not all_products:
-        all_products = [_build_product_response(p) for p in _LOCAL_PRODUCTOS.values()]
+    all_products: List[ProductoResponse] = _fetch_all_products(client, q)
 
     sugerencias: List[SugerenciaItem] = []
     for prod in all_products:
@@ -610,7 +629,56 @@ async def obtener_sugerencias(
 
 
 # ------------------------------------------------------------------------------
-# 4. LISTADO ESTÁNDAR Y DETALLE DE PRODUCTOS (COMPATIBILIDAD HACIA ATRÁS)
+# 4. MOTOR DE RECOMENDACIONES Y VENTA CRUZADA (CROSS-SELLING RF-19 / US-19)
+# ------------------------------------------------------------------------------
+@router.get("/recomendaciones", response_model=List[ProductoResponse])
+@router.get("/productos/{id}/recomendados", response_model=List[ProductoResponse])
+async def obtener_productos_recomendados(
+    id: Optional[UUID] = None,
+    categoria_id: Optional[UUID] = None,
+    limite: int = Query(4, ge=1, le=12, description="Número de recomendaciones a retornar"),
+):
+    """
+    RF-19: Motor algorítmico de recomendaciones y venta cruzada (Cross-selling / Up-selling):
+    - Si se especifica producto o categoría, prioriza ítems afines o complementarios.
+    - Si una búsqueda dio 0 resultados o no se envía ID, recomienda los artículos mejor calificados y de mayor disponibilidad.
+    """
+    client = _get_supabase_client_safe()
+    all_products = _fetch_all_products(client)
+
+    if not all_products:
+        return []
+
+    target_prod = None
+    if id:
+        target_prod = next((p for p in all_products if p.id == id), None)
+
+    cat_target_id = categoria_id or (target_prod.categoria_id if target_prod else None)
+    recomendados: List[ProductoResponse] = []
+
+    # 1. Si tenemos categoría objetivo: filtrar por la misma categoría (excluyendo el ítem actual)
+    if cat_target_id:
+        misma_cat = [
+            p for p in all_products 
+            if p.categoria_id == cat_target_id and (not target_prod or p.id != target_prod.id)
+        ]
+        misma_cat.sort(key=lambda p: (-(p.stock or 0), p.precio))
+        recomendados.extend(misma_cat[:limite])
+
+    # 2. Si aún faltan productos para completar el límite: rellenar con artículos destacados y con stock
+    if len(recomendados) < limite:
+        resto = [
+            p for p in all_products 
+            if p not in recomendados and (not target_prod or p.id != target_prod.id)
+        ]
+        resto.sort(key=lambda p: (0 if (p.stock or 0) > 0 else 1, -(p.stock or 0)))
+        recomendados.extend(resto[: limite - len(recomendados)])
+
+    return recomendados[:limite]
+
+
+# ------------------------------------------------------------------------------
+# 5. LISTADO ESTÁNDAR Y DETALLE DE PRODUCTOS (COMPATIBILIDAD HACIA ATRÁS)
 # ------------------------------------------------------------------------------
 @router.get("/productos", response_model=List[ProductoResponse])
 async def listar_productos(

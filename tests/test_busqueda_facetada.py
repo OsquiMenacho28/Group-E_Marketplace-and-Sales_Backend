@@ -134,8 +134,20 @@ def test_busqueda_facetada_suite():
     assert precios_desc == sorted(precios_desc, reverse=True), "Los precios deben estar en orden descendente"
     print(f"  -> OK: Precio descendente verificado: {precios_desc[:3]} ...")
 
+    # --------------------------------------------------------------------------
+    # 9. Motor de recomendaciones y venta cruzada (RF-19)
+    # --------------------------------------------------------------------------
+    print("\n[TEST 9] Consulta de productos recomendados (RF-19)...")
+    resp_rec = client.get("/api/v1/catalogo/recomendaciones?limite=4")
+    assert resp_rec.status_code == 200
+    rec_items = resp_rec.json()
+    assert len(rec_items) == 4, f"Se esperaban 4 recomendaciones, se obtuvieron {len(rec_items)}"
+    for r in rec_items:
+        assert "id" in r and "nombre" in r and "precio" in r and "stock" in r
+    print(f"  -> OK: {len(rec_items)} productos recomendados devueltos: {[r['nombre'] for r in rec_items[:2]]}")
+
     print("\n" + "=" * 70)
-    print("¡TODAS LAS PRUEBAS DE US-06 (RF-06) PASARON EXITOSAMENTE (8/8)!")
+    print("¡TODAS LAS PRUEBAS DE US-06 (RF-06) Y US-19 (RF-19) PASARON EXITOSAMENTE (9/9)!")
     print("=" * 70)
 
 

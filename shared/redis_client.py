@@ -80,12 +80,15 @@ async def save_suspended_sale(sale_id: str, sale_data: Dict[str, Any]):
     await redis.set(key, json.dumps(sale_data))
 
 
-async def get_suspended_sale(sale_id: str) -> Optional[Dict[str, Any]]:
+async def get_suspended_sale(
+    caja_id: str,
+    sale_id: str
+) -> Optional[Dict[str, Any]]:
     """
-    Obtiene una venta suspendida por su ID.
+    Obtiene una venta suspendida perteneciente a una caja.
     """
     redis = await get_redis()
-    key = f"pos:venta_suspendida:{sale_id}"
+    key = f"pos:venta_suspendida:{caja_id}:{sale_id}"
     raw = await redis.get(key)
 
     if not raw:
@@ -97,14 +100,18 @@ async def get_suspended_sale(sale_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def list_suspended_sales() -> List[Dict[str, Any]]:
+async def list_suspended_sales(
+    caja_id: str
+) -> List[Dict[str, Any]]:
     """
-    Lista todas las ventas actualmente suspendidas.
+    Lista las ventas suspendidas de una caja específica.
     """
     redis = await get_redis()
     sales = []
 
-    async for key in redis.scan_iter(match="pos:venta_suspendida:*"):
+    pattern = f"pos:venta_suspendida:{caja_id}:*"
+
+    async for key in redis.scan_iter(match=pattern):
         raw = await redis.get(key)
 
         if raw:
@@ -116,12 +123,15 @@ async def list_suspended_sales() -> List[Dict[str, Any]]:
     return sales
 
 
-async def delete_suspended_sale(sale_id: str) -> bool:
+async def delete_suspended_sale(
+    caja_id: str,
+    sale_id: str
+) -> bool:
     """
-    Elimina una venta suspendida de Redis al recuperarla.
+    Elimina una venta suspendida perteneciente a una caja.
     """
     redis = await get_redis()
-    key = f"pos:venta_suspendida:{sale_id}"
+    key = f"pos:venta_suspendida:{caja_id}:{sale_id}"
     deleted = await redis.delete(key)
 
     return deleted > 0

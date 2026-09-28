@@ -985,6 +985,39 @@ async def actualizar_producto(id: UUID, payload: ProductoUpdate):
 
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
 
+
+@router.put("/productos/{id}", response_model=ProductoResponse)
+async def actualizar_producto_completo(id: UUID, payload: ProductoUpdate):
+    """Alias PUT para actualizar producto completo o parcial."""
+    return await actualizar_producto(id, payload)
+
+
+@router.delete("/productos/{id}", status_code=status.HTTP_200_OK)
+async def eliminar_producto(id: UUID):
+    """
+    Elimina un producto del catálogo y difunde el evento SSE multicanal.
+    """
+    client = _get_supabase_client_safe()
+    if client:
+        client.table("productos").delete().eq("id", str(id)).execute()
+        await _broadcast_catalogo_event({
+            "tipo": "producto_eliminado",
+            "producto_id": str(id),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return {"mensaje": f"Producto {id} eliminado exitosamente", "id": str(id)}
+
+    if id in _LOCAL_PRODUCTOS:
+        _LOCAL_PRODUCTOS.pop(id, None)
+        await _broadcast_catalogo_event({
+            "tipo": "producto_eliminado",
+            "producto_id": str(id),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return {"mensaje": f"Producto {id} eliminado exitosamente", "id": str(id)}
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+
 # ==============================================================================
 # RF-08 — SINCRONIZACIÓN MULTICANAL (WEB <-> POS)
 # ==============================================================================

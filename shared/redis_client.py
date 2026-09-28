@@ -300,17 +300,17 @@ async def save_suspended_sale(
     key_caja = f"pos:venta_suspendida:{caja_id}:{sale_id}"
     key_direct = f"pos:venta_suspendida:{sale_id}"
     payload = json.dumps(data)
+
+    _in_memory_store[key_caja] = {"value": payload}
+    _in_memory_store[key_direct] = {"value": payload}
+
     redis = await get_redis()
     if redis:
         try:
             await redis.set(key_caja, payload)
             await redis.set(key_direct, payload)
-            return
         except Exception:
             _redis_unavailable = True
-
-    _in_memory_store[key_caja] = {"value": payload}
-    _in_memory_store[key_direct] = {"value": payload}
 
 
 async def get_suspended_sale(
@@ -392,7 +392,6 @@ async def list_suspended_sales(
                             sales.append(item)
                     except Exception:
                         continue
-            return sales
         except Exception:
             _redis_unavailable = True
 

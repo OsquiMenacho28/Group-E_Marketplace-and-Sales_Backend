@@ -151,3 +151,15 @@ class BusquedaStockResponse(BaseModel):
     query: str
     resultados: List[ProductoStockResumen] = []
     origen_cache: bool = False
+
+class PrecioResolucionResponse(BaseModel):
+    lista_precio_id: UUID
+    lista_nombre: str
+    variante_id: UUID
+    precio: Decimal
+    moneda: str
+    canal: str
+    tipo_cliente: str
+    sucursal_id: Optional[UUID] = None
+    fecha_inicio: str
+    fecha_fin: Optional[str] = None

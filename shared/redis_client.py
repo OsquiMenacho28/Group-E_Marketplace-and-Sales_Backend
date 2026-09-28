@@ -272,42 +272,91 @@ async def liberar_reserva_stock(reserva_id: str) -> bool:
 # Ventas suspendidas en POS (RF-12)
 # ------------------------------------------------------------------------------
 
-async def save_suspended_sale(sale_id: str, sale_data: Dict[str, Any]):
+async def save_suspended_sale(
+    caja_or_sale_id: str,
+    sale_id_or_data: Any,
+    sale_data: Optional[Dict[str, Any]] = None
+):
     """
     Guarda temporalmente una venta suspendida en Redis (con fallback en memoria).
+    Soporta firmas:
+      - save_suspended_sale(caja_id, sale_id, sale_data)
+      - save_suspended_sale(sale_id, sale_data)
     """
     global _redis_unavailable
-    key = f"pos:venta_suspendida:{sale_id}"
-    payload = json.dumps(sale_data)
+    if sale_data is not None:
+        caja_id = str(caja_or_sale_id)
+        sale_id = str(sale_id_or_data)
+        data = sale_data
+    elif isinstance(sale_id_or_data, dict):
+        caja_id = "general"
+        sale_id = str(caja_or_sale_id)
+        data = sale_id_or_data
+    else:
+        caja_id = str(caja_or_sale_id)
+        sale_id = str(sale_id_or_data)
+        data = {}
+
+    key_caja = f"pos:venta_suspendida:{caja_id}:{sale_id}"
+    key_direct = f"pos:venta_suspendida:{sale_id}"
+    payload = json.dumps(data)
     redis = await get_redis()
     if redis:
         try:
-            await redis.set(key, payload)
+            await redis.set(key_caja, payload)
+            await redis.set(key_direct, payload)
             return
         except Exception:
             _redis_unavailable = True
 
-    _in_memory_store[key] = {"value": payload}
+    _in_memory_store[key_caja] = {"value": payload}
+    _in_memory_store[key_direct] = {"value": payload}
 
 
-async def get_suspended_sale(sale_id: str) -> Optional[Dict[str, Any]]:
+async def get_suspended_sale(
+    caja_or_sale_id: str,
+    sale_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
-    Obtiene una venta suspendida por su ID.
+    Obtiene una venta suspendida perteneciente a una caja (o por ID directo).
     """
     global _redis_unavailable
-    key = f"pos:venta_suspendida:{sale_id}"
+    if sale_id is not None:
+        caja_id = str(caja_or_sale_id)
+        target_id = str(sale_id)
+        keys = [
+            f"pos:venta_suspendida:{caja_id}:{target_id}",
+            f"pos:venta_suspendida:{target_id}",
+        ]
+    else:
+        target_id = str(caja_or_sale_id)
+        keys = [
+            f"pos:venta_suspendida:{target_id}",
+            f"pos:venta_suspendida:general:{target_id}",
+        ]
+
     raw = None
     redis = await get_redis()
     if redis:
         try:
-            raw = await redis.get(key)
+            for k in keys:
+                raw = await redis.get(k)
+                if raw:
+                    break
         except Exception:
             _redis_unavailable = True
 
     if not raw:
-        entry = _in_memory_store.get(key)
-        if entry:
-            raw = entry.get("value")
+        for k in keys:
+            entry = _in_memory_store.get(k)
+            if entry:
+                raw = entry.get("value")
+                break
+        if not raw:
+            for k, entry in _in_memory_store.items():
+                if k.endswith(f":{target_id}"):
+                    raw = entry.get("value")
+                    break
 
     if not raw:
         return None
@@ -318,53 +367,89 @@ async def get_suspended_sale(sale_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def list_suspended_sales() -> List[Dict[str, Any]]:
+async def list_suspended_sales(
+    caja_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """
-    Lista todas las ventas actualmente suspendidas.
+    Lista las ventas suspendidas de una caja específica (o todas si no se especifica).
     """
     global _redis_unavailable
-    sales = []
+    sales: List[Dict[str, Any]] = []
+    seen_ids = set()
+    pattern = f"pos:venta_suspendida:{caja_id}:*" if caja_id else "pos:venta_suspendida:*"
+
     redis = await get_redis()
     if redis:
         try:
-            async for key in redis.scan_iter(match="pos:venta_suspendida:*"):
+            async for key in redis.scan_iter(match=pattern):
                 raw = await redis.get(key)
                 if raw:
                     try:
-                        sales.append(json.loads(raw))
+                        item = json.loads(raw)
+                        iid = item.get("id") or key
+                        if iid not in seen_ids:
+                            seen_ids.add(iid)
+                            sales.append(item)
                     except Exception:
                         continue
             return sales
         except Exception:
             _redis_unavailable = True
 
+    prefix = f"pos:venta_suspendida:{caja_id}:" if caja_id else "pos:venta_suspendida:"
     for k, entry in _in_memory_store.items():
-        if k.startswith("pos:venta_suspendida:"):
+        if k.startswith(prefix) or (not caja_id and k.startswith("pos:venta_suspendida:")):
             try:
-                sales.append(json.loads(entry["value"]))
+                item = json.loads(entry["value"])
+                iid = item.get("id") or k
+                if iid not in seen_ids:
+                    seen_ids.add(iid)
+                    sales.append(item)
             except Exception:
                 continue
 
     return sales
 
 
-async def delete_suspended_sale(sale_id: str) -> bool:
+async def delete_suspended_sale(
+    caja_or_sale_id: str,
+    sale_id: Optional[str] = None
+) -> bool:
     """
     Elimina una venta suspendida de Redis o de memoria al recuperarla.
     """
     global _redis_unavailable
-    key = f"pos:venta_suspendida:{sale_id}"
+    if sale_id is not None:
+        caja_id = str(caja_or_sale_id)
+        target_id = str(sale_id)
+        keys = [
+            f"pos:venta_suspendida:{caja_id}:{target_id}",
+            f"pos:venta_suspendida:{target_id}",
+        ]
+    else:
+        target_id = str(caja_or_sale_id)
+        keys = [
+            f"pos:venta_suspendida:{target_id}",
+            f"pos:venta_suspendida:general:{target_id}",
+        ]
+
     deleted_redis = False
-    if not _redis_unavailable:
+    redis = await get_redis()
+    if redis and not _redis_unavailable:
         try:
-            redis = await get_redis()
-            if redis:
-                deleted = await redis.delete(key)
-                deleted_redis = deleted > 0
+            for k in keys:
+                res = await redis.delete(k)
+                if res > 0:
+                    deleted_redis = True
         except Exception:
             _redis_unavailable = True
 
-    deleted_mem = _in_memory_store.pop(key, None) is not None
+    deleted_mem = False
+    for k in list(_in_memory_store.keys()):
+        if k in keys or k.endswith(f":{target_id}"):
+            _in_memory_store.pop(k, None)
+            deleted_mem = True
+
     return deleted_redis or deleted_mem
 
 # ------------------------------------------------------------------------------

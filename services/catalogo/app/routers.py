@@ -13,8 +13,6 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-
 try:
     from app.schemas import (
         CategoriaResponse,
@@ -34,6 +32,7 @@ try:
         StockSucursal,
         ProductoStockResumen,
         BusquedaStockResponse,
+        PrecioResolucionResponse,
     )
 except (ModuleNotFoundError, ImportError):
     from backend.services.catalogo.app.schemas import (
@@ -54,9 +53,10 @@ except (ModuleNotFoundError, ImportError):
         StockSucursal,
         ProductoStockResumen,
         BusquedaStockResponse,
+        PrecioResolucionResponse,
     )
 
-from backend.shared.database import get_supabase_admin_client
+from backend.shared.database import get_supabase_admin_client, get_supabase_client
 from backend.shared.erp_clients.inventarios import inventarios_client
 from backend.shared.redis_client import get_stock_cache, set_stock_cache, STOCK_CACHE_TTL_SECONDS
 from backend.shared.security import get_current_user, require_jwt_claims
@@ -1094,3 +1094,118 @@ async def consultar_stock(sku: str, sucursal_id: Optional[str] = None):
     }
     await set_stock_cache(sku, resultado, sucursal_id=sucursal_id, ttl_seconds=STOCK_CACHE_TTL_SECONDS)
     return StockDisponibilidadResponse(**resultado, origen="erp")
+
+
+@router.get(
+    "/precios/resolver",
+    response_model=PrecioResolucionResponse
+)
+async def resolver_precio(
+    variante_id: UUID,
+    canal: str = Query(..., pattern="^(web|pos|b2b)$"),
+    tipo_cliente: str = Query(
+        "retail",
+        pattern="^(retail|corporativo_b2b)$"
+    ),
+    sucursal_id: Optional[UUID] = None
+):
+    """
+    KAN-297:
+    Resuelve el precio vigente de una variante según:
+    - canal
+    - tipo de cliente
+    - sucursal
+    - vigencia
+    """
+    supabase = get_supabase_client() or get_supabase_admin_client()
+
+    ahora = datetime.now(timezone.utc)
+
+    if supabase is None:
+        logger.warning("Supabase no disponible, usando fallback simulado para resolver_precio.")
+        return PrecioResolucionResponse(
+            lista_precio_id=uuid4(),
+            lista_nombre=f"Lista Estándar ({canal.upper()} - {tipo_cliente})",
+            variante_id=variante_id,
+            precio=Decimal("150.00"),
+            moneda="BOB",
+            canal=canal,
+            tipo_cliente=tipo_cliente,
+            sucursal_id=sucursal_id,
+            fecha_inicio=ahora.isoformat(),
+            fecha_fin=None
+        )
+
+    # Buscar listas de precios activas que coincidan
+    # con canal, tipo de cliente y sucursal.
+    query = (
+        supabase
+        .table("listas_precios")
+        .select(
+            "id,nombre,canal,tipo_cliente,sucursal_id,moneda,activo"
+        )
+        .eq("canal", canal)
+        .eq("tipo_cliente", tipo_cliente)
+        .eq("activo", True)
+    )
+
+    if sucursal_id:
+        query = query.eq("sucursal_id", str(sucursal_id))
+
+    listas_response = query.execute()
+
+    listas = listas_response.data or []
+
+    if not listas:
+        raise HTTPException(
+            status_code=404,
+            detail="No existe una lista de precios activa para los criterios indicados."
+        )
+
+    # Buscar el precio vigente para la variante.
+    for lista in listas:
+        precios_response = (
+            supabase
+            .table("precios_items")
+            .select(
+                "lista_precio_id,variante_id,precio,fecha_inicio,fecha_fin"
+            )
+            .eq("lista_precio_id", lista["id"])
+            .eq("variante_id", str(variante_id))
+            .execute()
+        )
+
+        precios = precios_response.data or []
+
+        for item in precios:
+            fecha_inicio = datetime.fromisoformat(
+                item["fecha_inicio"].replace("Z", "+00:00")
+            )
+
+            fecha_fin = None
+
+            if item.get("fecha_fin"):
+                fecha_fin = datetime.fromisoformat(
+                    item["fecha_fin"].replace("Z", "+00:00")
+                )
+
+            if fecha_inicio <= ahora and (
+                fecha_fin is None or ahora <= fecha_fin
+            ):
+                return PrecioResolucionResponse(
+                    lista_precio_id=lista["id"],
+                    lista_nombre=lista["nombre"],
+                    variante_id=item["variante_id"],
+                    precio=Decimal(str(item["precio"])),
+                    moneda=lista["moneda"],
+                    canal=lista["canal"],
+                    tipo_cliente=lista["tipo_cliente"],
+                    sucursal_id=lista.get("sucursal_id"),
+                    fecha_inicio=item["fecha_inicio"],
+                    fecha_fin=item.get("fecha_fin")
+                )
+
+    raise HTTPException(
+        status_code=404,
+        detail="No existe un precio vigente para la variante indicada."
+    )

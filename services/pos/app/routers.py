@@ -115,10 +115,26 @@ async def procesar_venta_pos(
         ticket_impresion=ticket.strip()
     )
 
-@router.post("/ventas/suspender", status_code=status.HTTP_201_CREATED)
-async def suspender_venta(payload: VentaSuspendida):
-    """RF-12: Suspender transacción en caja para continuar con la fila."""
+@router.post(
+    "/ventas/{caja_id}/suspender",
+    status_code=status.HTTP_201_CREATED
+)
+async def suspender_venta(
+    caja_id: uuid.UUID,
+    payload: VentaSuspendida
+):
+    """RF-12: Suspender transacción en una caja."""
+
+    caja = _CAJAS_ACTIVAS.get(str(caja_id))
+
+    if not caja or caja.estado != "abierta":
+        raise HTTPException(
+            status_code=403,
+            detail="La caja no está abierta"
+        )
+
     await save_suspended_sale(
+        str(caja_id),
         payload.id,
         payload.model_dump(mode="json")
     )
@@ -129,10 +145,24 @@ async def suspender_venta(payload: VentaSuspendida):
     }
 
 
-@router.get("/ventas/suspendidas", response_model=List[VentaSuspendida])
-async def listar_ventas_suspendidas():
-    """RF-12: Recuperar lista de ventas en espera."""
-    ventas = await list_suspended_sales()
+@router.get(
+    "/ventas/{caja_id}/suspendidas",
+    response_model=List[VentaSuspendida]
+)
+async def listar_ventas_suspendidas(
+    caja_id: uuid.UUID
+):
+    """RF-12: Recuperar lista de ventas en espera de una caja."""
+
+    caja = _CAJAS_ACTIVAS.get(str(caja_id))
+
+    if not caja:
+        raise HTTPException(
+            status_code=404,
+            detail="Caja no encontrada"
+        )
+
+    ventas = await list_suspended_sales(str(caja_id))
 
     return [
         VentaSuspendida(**venta)
@@ -140,18 +170,69 @@ async def listar_ventas_suspendidas():
     ]
 
 
-@router.delete("/ventas/suspendidas/{id}")
-async def reanudar_venta_suspendida(id: str):
-    """RF-12: Reanudar venta y quitar de espera."""
-    venta = await get_suspended_sale(id)
+@router.delete("/ventas/{caja_id}/suspendidas/{id}")
+async def reanudar_venta_suspendida(
+    caja_id: uuid.UUID,
+    id: str
+):
+    """RF-12: Reanudar venta y quitarla de espera."""
+
+    caja = _CAJAS_ACTIVAS.get(str(caja_id))
+
+    if not caja:
+        raise HTTPException(
+            status_code=404,
+            detail="Caja no encontrada"
+        )
+
+    venta = await get_suspended_sale(
+        str(caja_id),
+        id
+    )
+
     if not venta:
         raise HTTPException(
             status_code=404,
             detail="Venta suspendida no encontrada"
         )
 
-    await delete_suspended_sale(id)
+    await delete_suspended_sale(
+        str(caja_id),
+        id
+    )
 
+    return venta
+
+
+@router.post("/ventas/suspender", status_code=status.HTTP_201_CREATED)
+async def suspender_venta_global(payload: VentaSuspendida):
+    """RF-12: Suspender transacción global/general."""
+    caja_id = "general"
+    for cid, c in _CAJAS_ACTIVAS.items():
+        if getattr(c, "estado", "") == "abierta":
+            caja_id = cid
+            break
+    await save_suspended_sale(str(caja_id), payload.id, payload.model_dump(mode="json"))
+    return {"mensaje": "Venta pausada exitosamente", "id": payload.id}
+
+
+@router.get("/ventas/suspendidas", response_model=List[VentaSuspendida])
+async def listar_ventas_suspendidas_todas():
+    """RF-12: Recuperar lista global de ventas en espera."""
+    ventas = await list_suspended_sales()
+    return [VentaSuspendida(**venta) for venta in ventas]
+
+
+@router.delete("/ventas/suspendidas/{id}")
+async def reanudar_venta_suspendida_global(id: str):
+    """RF-12: Reanudar venta por su ID directo."""
+    venta = await get_suspended_sale(id)
+    if not venta:
+        raise HTTPException(
+            status_code=404,
+            detail="Venta suspendida no encontrada"
+        )
+    await delete_suspended_sale(id)
     return venta
 
 @router.post("/pedidos/retiro-sucursal/validar")

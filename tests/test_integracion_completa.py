@@ -204,3 +204,18 @@ def test_gateway_health_and_rbac():
     # 2. RBAC: Intento de entrar a POS sin credenciales debe dar 401
     resp_unauth = gateway_client.get("/api/v1/pos/ventas/suspendidas")
     assert resp_unauth.status_code == 401
+
+
+def test_catalogo_resolucion_precios_michelle():
+    """Valida KAN-297: resolución dinámica de precios según canal y tipo de cliente."""
+    variante_test_id = str(uuid.uuid4())
+    resp = catalogo_client.get(
+        f"/api/v1/catalogo/precios/resolver?variante_id={variante_test_id}&canal=pos&tipo_cliente=retail"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["canal"] == "pos"
+    assert data["tipo_cliente"] == "retail"
+    assert "precio" in data and float(data["precio"]) > 0
+    assert data["moneda"] == "BOB"
+

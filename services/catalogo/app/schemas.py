@@ -10,6 +10,16 @@ class CategoriaBase(BaseModel):
     padre_id: Optional[UUID] = None
     atributos_dinamicos: List[str] = []
 
+class CategoriaCreate(CategoriaBase):
+    pass
+
+class CategoriaUpdate(BaseModel):
+    nombre: Optional[str] = None
+    descripcion: Optional[str] = None
+    padre_id: Optional[UUID] = None
+    atributos_dinamicos: Optional[List[str]] = None
+    activo: Optional[bool] = None
+
 class CategoriaResponse(CategoriaBase):
     id: UUID
     activo: bool = True
@@ -101,8 +111,10 @@ class ProductoUpdate(BaseModel):
     nombre: Optional[str] = None
     descripcion: Optional[str] = None
     marca: Optional[str] = None
+    categoria_id: Optional[UUID] = None
     estado: Optional[str] = None
     precio: Optional[Decimal] = Field(default=None, ge=0, description="Actualiza el precio de la variante principal")
+    atributos: Optional[Dict[str, Any]] = None
 
 # ------------------------------------------------------------------------------
 # RF-08: Sincronización Multicanal (delta por updated_at + eventos SSE)
@@ -121,6 +133,13 @@ class SyncCatalogoResponse(BaseModel):
     cursor_siguiente: Optional[str] = None
     hay_mas: bool = False
     servidor_timestamp: datetime
+
+class SyncStatusResponse(BaseModel):
+    suscriptores_activos: int
+    total_productos: int
+    ultima_sincronizacion: Optional[datetime] = None
+    eventos_recientes: List[Dict[str, Any]] = []
+    estado: str = "operativo"
 
 # ------------------------------------------------------------------------------
 # RF-07: Disponibilidad de Stock (con caché Redis TTL 30s, RIO-INV-01)
@@ -163,3 +182,60 @@ class PrecioResolucionResponse(BaseModel):
     sucursal_id: Optional[UUID] = None
     fecha_inicio: str
     fecha_fin: Optional[str] = None
+
+class ItemReordenarImagen(BaseModel):
+    id: UUID
+    orden: int
+
+class ReordenarImagenesRequest(BaseModel):
+    ordenes: List[ItemReordenarImagen]
+
+# ==============================================================================
+# RF-04 / US-04: LISTAS DE PRECIOS DIFERENCIADAS (CANAL, SUCURSAL, TIPO CLIENTE)
+# ==============================================================================
+class ListaPrecioCreate(BaseModel):
+    nombre: str = Field(..., min_length=2, max_length=100)
+    canal: str = Field(..., pattern="^(web|pos|b2b)$")
+    tipo_cliente: str = Field("retail", pattern="^(retail|corporativo_b2b)$")
+    sucursal_id: Optional[str] = None
+    sucursal_nombre: Optional[str] = None
+    moneda: str = Field("BOB", pattern="^(BOB|USD)$")
+    activo: bool = True
+
+class ListaPrecioUpdate(BaseModel):
+    nombre: Optional[str] = None
+    canal: Optional[str] = None
+    tipo_cliente: Optional[str] = None
+    sucursal_id: Optional[str] = None
+    sucursal_nombre: Optional[str] = None
+    moneda: Optional[str] = None
+    activo: Optional[bool] = None
+
+class PrecioItemCreate(BaseModel):
+    variante_id: str
+    precio: Decimal = Field(..., ge=0)
+    fecha_inicio: Optional[datetime] = None
+    fecha_fin: Optional[datetime] = None
+
+class PrecioItemResponse(BaseModel):
+    id: str
+    lista_precio_id: str
+    variante_id: str
+    sku: Optional[str] = None
+    nombre: Optional[str] = None
+    precio: Decimal
+    fecha_inicio: Optional[datetime] = None
+    fecha_fin: Optional[datetime] = None
+
+class ListaPrecioResponse(BaseModel):
+    id: str
+    nombre: str
+    canal: str
+    tipo_cliente: str
+    sucursal_id: Optional[str] = None
+    sucursal_nombre: Optional[str] = None
+    moneda: str
+    activo: bool
+    total_items: Optional[int] = 0
+    items: Optional[List[PrecioItemResponse]] = []
+    created_at: Optional[datetime] = None

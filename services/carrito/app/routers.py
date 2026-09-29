@@ -215,9 +215,7 @@ async def cancelar_reserva_checkout(reserva_id: str):
 )
 async def agregar_deseo(cliente_id: uuid.UUID, payload: WishlistAdd):
     """RF-21: Agregar una variante a la lista de deseos."""
-
     supabase = get_supabase_client()
-
     if supabase is None:
         raise HTTPException(
             status_code=503,
@@ -225,6 +223,18 @@ async def agregar_deseo(cliente_id: uuid.UUID, payload: WishlistAdd):
         )
 
     try:
+        # Verificar si ya existe previamente para no fallar por unique constraint
+        existente = (
+            supabase
+            .table("deseos")
+            .select("*")
+            .eq("cliente_id", str(cliente_id))
+            .eq("variante_id", str(payload.variante_id))
+            .execute()
+        )
+        if existente.data and len(existente.data) > 0:
+            return existente.data[0]
+
         response = (
             supabase
             .table("deseos")
@@ -243,6 +253,8 @@ async def agregar_deseo(cliente_id: uuid.UUID, payload: WishlistAdd):
 
         return response.data[0]
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=400,
@@ -254,26 +266,53 @@ async def agregar_deseo(cliente_id: uuid.UUID, payload: WishlistAdd):
     response_model=List[WishlistResponse]
 )
 async def listar_deseos(cliente_id: uuid.UUID):
-    """RF-21: Consultar la lista de deseos del cliente."""
-
+    """RF-21: Consultar la lista de deseos del cliente enriquecida con datos del producto."""
     supabase = get_supabase_client()
-
     if supabase is None:
         raise HTTPException(
             status_code=503,
             detail="Servicio de base de datos no disponible"
         )
 
-    response = (
-        supabase
-        .table("deseos")
-        .select("*")
-        .eq("cliente_id", str(cliente_id))
-        .order("created_at", desc=True)
-        .execute()
-    )
-
-    return response.data
+    try:
+        # Intenta consulta con JOIN a variantes y productos
+        response = (
+            supabase
+            .table("deseos")
+            .select("*, variantes(id, sku, nombre_variante, precio, productos(id, nombre, imagenes_producto(url, es_principal)))")
+            .eq("cliente_id", str(cliente_id))
+            .order("created_at", desc=True)
+            .execute()
+        )
+        items = []
+        for row in (response.data or []):
+            var_data = row.get("variantes") or {}
+            prod_data = var_data.get("productos") or {}
+            imgs = prod_data.get("imagenes_producto") or []
+            main_img = next((img["url"] for img in imgs if img.get("es_principal")), (imgs[0]["url"] if imgs else None))
+            nombre = prod_data.get("nombre") or var_data.get("nombre_variante") or "Producto sin nombre"
+            items.append({
+                "id": row["id"],
+                "cliente_id": row["cliente_id"],
+                "variante_id": row["variante_id"],
+                "created_at": row["created_at"],
+                "sku": var_data.get("sku"),
+                "nombre": nombre,
+                "precio": var_data.get("precio"),
+                "imagen_url": main_img
+            })
+        return items
+    except Exception:
+        # Fallback a consulta simple de deseos
+        fallback = (
+            supabase
+            .table("deseos")
+            .select("*")
+            .eq("cliente_id", str(cliente_id))
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return fallback.data or []
 
 @router.delete(
     "/{cliente_id}/deseos/{variante_id}",
@@ -284,9 +323,7 @@ async def eliminar_deseo(
     variante_id: uuid.UUID
 ):
     """RF-21: Eliminar una variante de la lista de deseos."""
-
     supabase = get_supabase_client()
-
     if supabase is None:
         raise HTTPException(
             status_code=503,

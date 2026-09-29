@@ -10,11 +10,13 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 try:
     from app.schemas import (
+        CategoriaCreate,
+        CategoriaUpdate,
         CategoriaResponse,
         ProductoCreate,
         ProductoResponse,
@@ -28,14 +30,22 @@ try:
         SugerenciaItem,
         SyncCatalogoItem,
         SyncCatalogoResponse,
+        SyncStatusResponse,
         StockDisponibilidadResponse,
         StockSucursal,
         ProductoStockResumen,
         BusquedaStockResponse,
         PrecioResolucionResponse,
+        ListaPrecioCreate,
+        ListaPrecioUpdate,
+        ListaPrecioResponse,
+        PrecioItemCreate,
+        PrecioItemResponse,
     )
 except (ModuleNotFoundError, ImportError):
     from backend.services.catalogo.app.schemas import (
+        CategoriaCreate,
+        CategoriaUpdate,
         CategoriaResponse,
         ProductoCreate,
         ProductoResponse,
@@ -49,11 +59,17 @@ except (ModuleNotFoundError, ImportError):
         SugerenciaItem,
         SyncCatalogoItem,
         SyncCatalogoResponse,
+        SyncStatusResponse,
         StockDisponibilidadResponse,
         StockSucursal,
         ProductoStockResumen,
         BusquedaStockResponse,
         PrecioResolucionResponse,
+        ListaPrecioCreate,
+        ListaPrecioUpdate,
+        ListaPrecioResponse,
+        PrecioItemCreate,
+        PrecioItemResponse,
     )
 
 from backend.shared.database import get_supabase_admin_client, get_supabase_client
@@ -246,6 +262,7 @@ _SEED_PRODUCTOS: List[Dict[str, Any]] = [
 # Almacén de catálogo dinámico en memoria
 _LOCAL_CATEGORIAS: Dict[UUID, Dict[str, Any]] = {c["id"]: c for c in _SEED_CATEGORIAS}
 _LOCAL_PRODUCTOS: Dict[UUID, Dict[str, Any]] = {p["id"]: p for p in _SEED_PRODUCTOS}
+_LOCAL_IMAGENES: Dict[UUID, List[Dict[str, Any]]] = {}
 
 
 def _get_supabase_client_safe() -> Optional[Any]:
@@ -415,9 +432,13 @@ def _ensure_bucket(client: Any) -> None:
 # difunde el evento a todas las colas activas (broadcast simple in-process).
 # ------------------------------------------------------------------------------
 _SYNC_SUBSCRIBERS: List["asyncio.Queue[Dict[str, Any]]"] = []
+_RECENT_SYNC_EVENTS: List[Dict[str, Any]] = []
 
 async def _broadcast_catalogo_event(evento: Dict[str, Any]) -> None:
     evento_completo = {**evento, "emitido_en": datetime.now(timezone.utc).isoformat()}
+    _RECENT_SYNC_EVENTS.insert(0, evento_completo)
+    if len(_RECENT_SYNC_EVENTS) > 50:
+        _RECENT_SYNC_EVENTS.pop()
     for cola in list(_SYNC_SUBSCRIBERS):
         await cola.put(evento_completo)
 
@@ -455,6 +476,76 @@ async def listar_categorias():
         for c in _LOCAL_CATEGORIAS.values()
         if c.get("activo", True)
     ]
+
+
+@router.post("/categorias", response_model=CategoriaResponse, status_code=status.HTTP_201_CREATED)
+async def crear_categoria(payload: CategoriaCreate):
+    """RF-02 / US-02: Crear categoría jerárquica con atributos dinámicos."""
+    cat_id = uuid4()
+    cat_dict = {
+        "id": cat_id,
+        "nombre": payload.nombre.strip(),
+        "descripcion": payload.descripcion.strip() if payload.descripcion else None,
+        "padre_id": payload.padre_id,
+        "atributos_dinamicos": payload.atributos_dinamicos or [],
+        "activo": True
+    }
+
+    client = _get_supabase_client_safe()
+    if client:
+        try:
+            insert_payload = {
+                "id": str(cat_id),
+                "nombre": payload.nombre.strip(),
+                "descripcion": payload.descripcion.strip() if payload.descripcion else None,
+                "padre_id": str(payload.padre_id) if payload.padre_id else None,
+                "atributos_dinamicos": payload.atributos_dinamicos or [],
+                "activo": True
+            }
+            res = client.table("categorias").insert(insert_payload).execute()
+            if res.data and len(res.data) > 0:
+                created = res.data[0]
+                _LOCAL_CATEGORIAS[cat_id] = created
+                return CategoriaResponse(**created)
+        except Exception as e:
+            logger.warning(f"Aviso al insertar categoría en Supabase: {e}. Guardando en memoria local.")
+
+    _LOCAL_CATEGORIAS[cat_id] = cat_dict
+    return CategoriaResponse(**cat_dict)
+
+
+@router.put("/categorias/{id}", response_model=CategoriaResponse)
+async def actualizar_categoria(id: UUID, payload: CategoriaUpdate):
+    """RF-02 / US-02: Actualizar categoría jerárquica existente."""
+    client = _get_supabase_client_safe()
+    update_data: Dict[str, Any] = {}
+    if payload.nombre is not None:
+        update_data["nombre"] = payload.nombre.strip()
+    if payload.descripcion is not None:
+        update_data["descripcion"] = payload.descripcion.strip()
+    if payload.padre_id is not None:
+        update_data["padre_id"] = str(payload.padre_id)
+    if payload.atributos_dinamicos is not None:
+        update_data["atributos_dinamicos"] = payload.atributos_dinamicos
+    if payload.activo is not None:
+        update_data["activo"] = payload.activo
+
+    if client and update_data:
+        try:
+            res = client.table("categorias").update(update_data).eq("id", str(id)).execute()
+            if res.data and len(res.data) > 0:
+                updated = res.data[0]
+                _LOCAL_CATEGORIAS[id] = updated
+                return CategoriaResponse(**updated)
+        except Exception as e:
+            logger.warning(f"Error al actualizar categoría en Supabase: {e}")
+
+    if id in _LOCAL_CATEGORIAS:
+        current = _LOCAL_CATEGORIAS[id]
+        current.update({k: v for k, v in update_data.items() if v is not None})
+        return CategoriaResponse(**current)
+
+    raise HTTPException(status_code=404, detail="Categoría no encontrada")
 
 
 # ------------------------------------------------------------------------------
@@ -723,15 +814,18 @@ async def obtener_productos_recomendados(
 # ------------------------------------------------------------------------------
 @router.get("/productos", response_model=List[ProductoResponse])
 async def listar_productos(
-    q: Optional[str] = Query(None, description="Texto de búsqueda facetada RF-06"),
+    q: Optional[str] = Query(None, description="Texto de búsqueda facetada"),
     categoria_id: Optional[UUID] = Query(None),
+    estado: Optional[str] = Query(None, description="Filtrar por estado del ciclo de vida"),
     precio_min: Optional[Decimal] = Query(None),
     precio_max: Optional[Decimal] = Query(None),
 ):
     client = _get_supabase_client_safe()
     if client:
         try:
-            query = client.table("productos").select("*").eq("estado", "publicado")
+            query = client.table("productos").select("*, categorias(*), variantes(*), imagenes_producto(*)")
+            if estado:
+                query = query.eq("estado", estado)
             if q:
                 query = query.or_(f"nombre.ilike.%{q}%,sku.ilike.%{q}%,marca.ilike.%{q}%")
             if categoria_id:
@@ -935,14 +1029,22 @@ async def actualizar_producto(id: UUID, payload: ProductoUpdate):
             update_data["marca"] = payload.marca
         if payload.estado is not None:
             update_data["estado"] = payload.estado
-        
+        if payload.categoria_id is not None:
+            update_data["categoria_id"] = str(payload.categoria_id)
+
         if update_data:
             client.table("productos").update(update_data).eq("id", str(id)).execute()
 
-        if payload.precio is not None:
-            var_row = client.table("variantes").select("id").eq("producto_id", str(id)).order("created_at").limit(1).execute()
+        if payload.precio is not None or payload.atributos is not None:
+            var_row = client.table("variantes").select("id, atributos").eq("producto_id", str(id)).order("created_at").limit(1).execute()
             if var_row.data:
-                client.table("variantes").update({"precio": float(payload.precio)}).eq("id", var_row.data[0]["id"]).execute()
+                var_update = {}
+                if payload.precio is not None:
+                    var_update["precio"] = float(payload.precio)
+                if payload.atributos is not None:
+                    var_update["atributos"] = payload.atributos
+                if var_update:
+                    client.table("variantes").update(var_update).eq("id", var_row.data[0]["id"]).execute()
 
         prod_res = client.table("productos").select("*, categorias(*), variantes(*), imagenes_producto(*)").eq("id", str(id)).limit(1).execute()
         if prod_res.data:
@@ -968,8 +1070,12 @@ async def actualizar_producto(id: UUID, payload: ProductoUpdate):
             p["marca"] = payload.marca
         if payload.estado is not None:
             p["estado"] = payload.estado
+        if payload.categoria_id is not None:
+            p["categoria_id"] = payload.categoria_id
         if payload.precio is not None:
             p["precio"] = payload.precio
+        if payload.atributos is not None and "variantes" in p and len(p["variantes"]) > 0:
+            p["variantes"][0]["atributos"] = payload.atributos
 
         resp = _build_product_response(p)
         await _broadcast_catalogo_event({
@@ -1017,6 +1123,380 @@ async def eliminar_producto(id: UUID):
         return {"mensaje": f"Producto {id} eliminado exitosamente", "id": str(id)}
 
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+
+
+# ==============================================================================
+# GESTIÓN MULTIMEDIA E IMÁGENES DE PRODUCTOS (KAN-75 / KAN-76 / KAN-77 / KAN-78)
+# ==============================================================================
+
+@router.get("/productos/{id}/imagenes")
+async def listar_imagenes_producto(id: UUID):
+    """
+    Lista las imágenes de un producto ordenadas por orden y created_at.
+    Soporta Supabase PostgreSQL y fallback en memoria.
+    """
+    client = _get_supabase_client_safe()
+    if client:
+        try:
+            prod_check = client.table("productos").select("id").eq("id", str(id)).execute()
+            if prod_check.data:
+                res = (
+                    client.table("imagenes_producto")
+                    .select("*")
+                    .eq("producto_id", str(id))
+                    .order("orden")
+                    .order("created_at")
+                    .execute()
+                )
+                raw_list = res.data or []
+                enriched = []
+                for img in raw_list:
+                    url = img.get("url") or ""
+                    thumb = url
+                    marker = f"/object/public/{STORAGE_BUCKET}/{id}/"
+                    if marker in url:
+                        thumb = url.replace(f"/{id}/", f"/{id}/thumbs/")
+                    enriched.append({
+                        **img,
+                        "thumbnailUrl": thumb,
+                    })
+                return {"imagenes": enriched}
+        except Exception as e:
+            logger.warning(f"Error consultando imagenes_producto de Supabase para {id}: {e}")
+
+    # Fallback local en memoria
+    if id in _LOCAL_IMAGENES:
+        return {"imagenes": _LOCAL_IMAGENES[id]}
+
+    if id in _LOCAL_PRODUCTOS:
+        p = _LOCAL_PRODUCTOS[id]
+        img_urls = p.get("imagenes") or []
+        local_list = [
+            {
+                "id": str(uuid4()),
+                "producto_id": str(id),
+                "variante_id": None,
+                "url": u,
+                "thumbnailUrl": u,
+                "es_principal": idx == 0,
+                "orden": idx,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            for idx, u in enumerate(img_urls)
+        ]
+        _LOCAL_IMAGENES[id] = local_list
+        return {"imagenes": local_list}
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado")
+
+
+@router.post("/productos/{id}/imagenes", status_code=status.HTTP_201_CREATED)
+async def subir_imagenes_producto(
+    id: UUID,
+    imagenes: List[UploadFile] = File(...),
+):
+    """
+    Sube una o múltiples imágenes para un producto (multipart/form-data).
+    Guarda en Supabase Storage bucket 'productos' e inserta metadatos en imagenes_producto.
+    """
+    if not imagenes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se enviaron archivos de imagen."
+        )
+
+    client = _get_supabase_client_safe()
+    uploaded_results = []
+
+    if client:
+        try:
+            prod_check = client.table("productos").select("id, nombre").eq("id", str(id)).execute()
+            if not prod_check.data:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado.")
+
+            existing_res = (
+                client.table("imagenes_producto")
+                .select("id, es_principal, orden")
+                .eq("producto_id", str(id))
+                .order("orden", desc=True)
+                .execute()
+            )
+            existing_images = existing_res.data or []
+            current_max_order = max([i.get("orden", 0) for i in existing_images], default=-1)
+            has_principal = any(i.get("es_principal") for i in existing_images)
+
+            _ensure_bucket(client)
+
+            for idx, file in enumerate(imagenes):
+                content = await file.read()
+                if not content:
+                    continue
+                if len(content) > MAX_IMAGE_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"La imagen {file.filename} excede el límite de 5 MB."
+                    )
+
+                content_type = file.content_type or "image/jpeg"
+                extension = ALLOWED_IMAGE_TYPES.get(content_type, "jpg")
+                file_uid = uuid4()
+                path = f"productos/{id}/{file_uid}.{extension}"
+
+                client.storage.from_(STORAGE_BUCKET).upload(
+                    path,
+                    content,
+                    {"content-type": content_type, "upsert": "true"}
+                )
+                image_url = client.storage.from_(STORAGE_BUCKET).get_public_url(path)
+
+                current_max_order += 1
+                is_principal = not has_principal and idx == 0
+                if is_principal:
+                    has_principal = True
+
+                insert_payload = {
+                    "id": str(file_uid),
+                    "producto_id": str(id),
+                    "url": image_url,
+                    "es_principal": is_principal,
+                    "orden": current_max_order,
+                }
+                insert_res = client.table("imagenes_producto").insert(insert_payload).execute()
+                record = insert_res.data[0] if insert_res.data else insert_payload
+                record["thumbnailUrl"] = image_url
+                uploaded_results.append(record)
+
+            await _broadcast_catalogo_event({
+                "tipo": "producto_imagenes_actualizadas",
+                "producto_id": str(id),
+                "total_imagenes": len(existing_images) + len(uploaded_results),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+            return {
+                "success": True,
+                "message": f"{len(uploaded_results)} recurso(s) multimedia procesado(s) exitosamente.",
+                "imagenes": uploaded_results,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error subiendo imágenes a Supabase: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    # Fallback local en memoria
+    if id not in _LOCAL_PRODUCTOS and id not in _LOCAL_IMAGENES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado.")
+
+    if id not in _LOCAL_IMAGENES:
+        _LOCAL_IMAGENES[id] = []
+
+    has_principal = any(i.get("es_principal") for i in _LOCAL_IMAGENES[id])
+    current_max_order = max([i.get("orden", 0) for i in _LOCAL_IMAGENES[id]], default=-1)
+
+    for idx, file in enumerate(imagenes):
+        content = await file.read()
+        if not content:
+            continue
+        file_uid = uuid4()
+        b64 = base64.b64encode(content).decode("utf-8")
+        data_url = f"data:{file.content_type or 'image/jpeg'};base64,{b64}"
+        current_max_order += 1
+        is_principal = not has_principal and idx == 0
+        if is_principal:
+            has_principal = True
+
+        rec = {
+            "id": str(file_uid),
+            "producto_id": str(id),
+            "variante_id": None,
+            "url": data_url,
+            "thumbnailUrl": data_url,
+            "es_principal": is_principal,
+            "orden": current_max_order,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _LOCAL_IMAGENES[id].append(rec)
+        uploaded_results.append(rec)
+
+    return {
+        "success": True,
+        "message": f"{len(uploaded_results)} recurso(s) multimedia guardado(s) exitosamente.",
+        "imagenes": uploaded_results,
+    }
+
+
+@router.patch("/productos/{id}/imagenes/{imagen_id}/principal")
+async def marcar_imagen_principal(id: UUID, imagen_id: UUID):
+    """
+    Designa una imagen como portada principal del producto y desmarca las demás.
+    """
+    client = _get_supabase_client_safe()
+    if client:
+        try:
+            client.table("imagenes_producto").update({"es_principal": False}).eq("producto_id", str(id)).execute()
+            res = (
+                client.table("imagenes_producto")
+                .update({"es_principal": True})
+                .eq("id", str(imagen_id))
+                .eq("producto_id", str(id))
+                .execute()
+            )
+            if not res.data:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Imagen no encontrada para este producto.")
+
+            updated = res.data[0]
+            await _broadcast_catalogo_event({
+                "tipo": "producto_portada_actualizada",
+                "producto_id": str(id),
+                "imagen_id": str(imagen_id),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            return {
+                "success": True,
+                "message": "Imagen designada como portada principal del producto.",
+                "imagen": updated,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error marcando imagen principal en Supabase: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    # Fallback local
+    if id in _LOCAL_IMAGENES:
+        found = False
+        target_img = None
+        for img in _LOCAL_IMAGENES[id]:
+            is_match = (str(img["id"]) == str(imagen_id))
+            img["es_principal"] = is_match
+            if is_match:
+                found = True
+                target_img = img
+        if not found:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Imagen no encontrada para este producto.")
+        return {
+            "success": True,
+            "message": "Imagen designada como portada principal del producto.",
+            "imagen": target_img,
+        }
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado.")
+
+
+@router.delete("/productos/{id}/imagenes/{imagen_id}")
+async def eliminar_imagen_producto(id: UUID, imagen_id: UUID):
+    """
+    Elimina un recurso multimedia de la base de datos y de Supabase Storage.
+    Si era la imagen principal, promueve automáticamente la siguiente en orden.
+    """
+    client = _get_supabase_client_safe()
+    if client:
+        try:
+            find_res = client.table("imagenes_producto").select("*").eq("id", str(imagen_id)).eq("producto_id", str(id)).execute()
+            if not find_res.data:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurso multimedia no encontrado.")
+
+            img_record = find_res.data[0]
+            url = img_record.get("url") or ""
+
+            marker = f"/storage/v1/object/public/{STORAGE_BUCKET}/"
+            if marker in url:
+                try:
+                    rel_path = url.split(marker)[1]
+                    client.storage.from_(STORAGE_BUCKET).remove([rel_path])
+                except Exception as st_err:
+                    logger.warning(f"Aviso al eliminar archivo de storage: {st_err}")
+
+            client.table("imagenes_producto").delete().eq("id", str(imagen_id)).eq("producto_id", str(id)).execute()
+
+            if img_record.get("es_principal"):
+                remaining = client.table("imagenes_producto").select("id").eq("producto_id", str(id)).order("orden").limit(1).execute()
+                if remaining.data:
+                    client.table("imagenes_producto").update({"es_principal": True}).eq("id", remaining.data[0]["id"]).execute()
+
+            await _broadcast_catalogo_event({
+                "tipo": "producto_imagen_eliminada",
+                "producto_id": str(id),
+                "imagen_id": str(imagen_id),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+            return {
+                "success": True,
+                "message": "Recurso multimedia eliminado exitosamente.",
+                "id": str(imagen_id),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error eliminando imagen en Supabase: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    # Fallback local
+    if id in _LOCAL_IMAGENES:
+        initial_len = len(_LOCAL_IMAGENES[id])
+        _LOCAL_IMAGENES[id] = [i for i in _LOCAL_IMAGENES[id] if str(i["id"]) != str(imagen_id)]
+        if len(_LOCAL_IMAGENES[id]) == initial_len:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recurso multimedia no encontrado.")
+        if _LOCAL_IMAGENES[id] and not any(i.get("es_principal") for i in _LOCAL_IMAGENES[id]):
+            _LOCAL_IMAGENES[id][0]["es_principal"] = True
+        return {
+            "success": True,
+            "message": "Recurso multimedia eliminado exitosamente.",
+            "id": str(imagen_id),
+        }
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado.")
+
+
+@router.put("/productos/{id}/imagenes/reordenar")
+async def reordenar_imagenes_producto(id: UUID, payload: Dict[str, Any]):
+    """
+    Reordena la galería visual de imágenes de un producto.
+    """
+    ordenes = payload.get("ordenes")
+    if not isinstance(ordenes, list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='El cuerpo debe contener un arreglo "ordenes" con { id, orden }.'
+        )
+
+    client = _get_supabase_client_safe()
+    if client:
+        try:
+            for item in ordenes:
+                item_id = item.get("id")
+                item_orden = item.get("orden", 0)
+                if item_id:
+                    client.table("imagenes_producto").update({"orden": item_orden}).eq("id", str(item_id)).eq("producto_id", str(id)).execute()
+
+            updated_list_res = client.table("imagenes_producto").select("*").eq("producto_id", str(id)).order("orden").execute()
+            return {
+                "success": True,
+                "message": "Orden de galería actualizado exitosamente.",
+                "imagenes": updated_list_res.data or [],
+            }
+        except Exception as e:
+            logger.error(f"Error reordenando imágenes en Supabase: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    # Fallback local
+    if id in _LOCAL_IMAGENES:
+        orden_map = {str(item.get("id")): item.get("orden", 0) for item in ordenes}
+        for img in _LOCAL_IMAGENES[id]:
+            if str(img["id"]) in orden_map:
+                img["orden"] = orden_map[str(img["id"])]
+        _LOCAL_IMAGENES[id].sort(key=lambda x: x.get("orden", 0))
+        return {
+            "success": True,
+            "message": "Orden de galería actualizado exitosamente.",
+            "imagenes": _LOCAL_IMAGENES[id],
+        }
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Producto no encontrado.")
+
+
 
 # ==============================================================================
 # RF-08 — SINCRONIZACIÓN MULTICANAL (WEB <-> POS)
@@ -1102,6 +1582,53 @@ async def sync_events_stream():
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
+
+@router.get("/sync-status", response_model=SyncStatusResponse)
+async def get_sync_status():
+    """
+    RF-08: Estado y métricas de sincronización multicanal (Web <-> POS)
+    para el Administrador o Sistema.
+    """
+    client = _get_supabase_client_safe()
+    universo = _fetch_all_products(client)
+    max_updated = max((p.updated_at for p in universo), default=None) if universo else None
+
+    return SyncStatusResponse(
+        suscriptores_activos=len(_SYNC_SUBSCRIBERS),
+        total_productos=len(universo),
+        ultima_sincronizacion=max_updated,
+        eventos_recientes=_RECENT_SYNC_EVENTS[:20],
+        estado="operativo"
+    )
+
+
+@router.post("/sync-catalogo/forzar")
+async def forzar_sincronizacion_catalogo():
+    """
+    RF-08: Fuerza una difusión masiva de sincronización a todas las terminales
+    POS conectadas mediante SSE, solicitando actualización inmediata de catálogo.
+    """
+    client = _get_supabase_client_safe()
+    universo = _fetch_all_products(client)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    evento = {
+        "tipo": "sincronizacion_masiva",
+        "mensaje": "Sincronización forzada por Administrador o Sistema",
+        "total_productos": len(universo),
+        "origen": "administrador",
+        "emitido_en": now_iso
+    }
+    await _broadcast_catalogo_event(evento)
+
+    return {
+        "mensaje": "Evento de sincronización masiva emitido exitosamente a todas las terminales POS.",
+        "suscriptores_notificados": len(_SYNC_SUBSCRIBERS),
+        "total_productos": len(universo),
+        "timestamp": now_iso
+    }
+
+
 # ==============================================================================
 # RF-07 — DISPONIBILIDAD DE STOCK EN TIEMPO REAL (RIO-INV-01 + CACHÉ REDIS)
 # ==============================================================================
@@ -1129,116 +1656,622 @@ async def consultar_stock(sku: str, sucursal_id: Optional[str] = None):
     return StockDisponibilidadResponse(**resultado, origen="erp")
 
 
+# ==============================================================================
+# RF-04 / US-04: LISTAS DE PRECIOS DIFERENCIADAS (CANAL, SUCURSAL, TIPO CLIENTE)
+# ==============================================================================
+
+_SUCURSALES_NOMBRES_MAP = {
+    "SUC-LP-CENTRAL": "Sucursal Central - La Paz",
+    "SUC-LP-SOPOCACHI": "Sucursal Sopocachi - La Paz",
+    "SUC-SCZ-EQUIPETROL": "Sucursal Equipetrol - Santa Cruz",
+    "SUC-CBB-CENTRO": "Sucursal Centro - Cochabamba"
+}
+
+_LOCAL_LISTAS_PRECIOS: Dict[str, Dict[str, Any]] = {
+    "11111111-1111-1111-1111-111111111111": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "nombre": "Lista Estándar Web (Retail)",
+        "canal": "web",
+        "tipo_cliente": "retail",
+        "sucursal_id": None,
+        "sucursal_nombre": "Canal Digital / Nacional",
+        "moneda": "BOB",
+        "activo": True,
+        "created_at": datetime.now(timezone.utc),
+    },
+    "22222222-2222-2222-2222-222222222222": {
+        "id": "22222222-2222-2222-2222-222222222222",
+        "nombre": "Lista Sucursal Central POS (Retail)",
+        "canal": "pos",
+        "tipo_cliente": "retail",
+        "sucursal_id": "SUC-LP-CENTRAL",
+        "sucursal_nombre": "Sucursal Central - La Paz",
+        "moneda": "BOB",
+        "activo": True,
+        "created_at": datetime.now(timezone.utc),
+    },
+    "33333333-3333-3333-3333-333333333333": {
+        "id": "33333333-3333-3333-3333-333333333333",
+        "nombre": "Lista B2B Mayorista Corporativo",
+        "canal": "b2b",
+        "tipo_cliente": "corporativo_b2b",
+        "sucursal_id": None,
+        "sucursal_nombre": "Canal Mayorista B2B",
+        "moneda": "BOB",
+        "activo": True,
+        "created_at": datetime.now(timezone.utc),
+    },
+    "44444444-4444-4444-4444-444444444444": {
+        "id": "44444444-4444-4444-4444-444444444444",
+        "nombre": "Lista Dólares Corporativo (USD)",
+        "canal": "web",
+        "tipo_cliente": "corporativo_b2b",
+        "sucursal_id": None,
+        "sucursal_nombre": "Comercio Exterior / Corporativo",
+        "moneda": "USD",
+        "activo": True,
+        "created_at": datetime.now(timezone.utc),
+    }
+}
+
+_LOCAL_PRECIOS_ITEMS: Dict[str, Dict[str, Any]] = {
+    "item-b2b-01": {
+        "id": "55555555-5555-5555-5555-555555555551",
+        "lista_precio_id": "33333333-3333-3333-3333-333333333333",
+        "variante_id": "20000000-0000-0000-0000-000000000001",
+        "sku": "LAP-DELL-XPS15",
+        "nombre": "Laptop Dell XPS 15 (OLED 4K, i7 13va Gen)",
+        "precio": Decimal("7649.00"),
+        "fecha_inicio": datetime.now(timezone.utc),
+        "fecha_fin": None,
+    },
+    "item-usd-01": {
+        "id": "55555555-5555-5555-5555-555555555552",
+        "lista_precio_id": "44444444-4444-4444-4444-444444444444",
+        "variante_id": "20000000-0000-0000-0000-000000000001",
+        "sku": "LAP-DELL-XPS15",
+        "nombre": "Laptop Dell XPS 15 (OLED 4K, i7 13va Gen)",
+        "precio": Decimal("1100.00"),
+        "fecha_inicio": datetime.now(timezone.utc),
+        "fecha_fin": None,
+    },
+    "item-pos-01": {
+        "id": "55555555-5555-5555-5555-555555555553",
+        "lista_precio_id": "22222222-2222-2222-2222-222222222222",
+        "variante_id": "20000000-0000-0000-0000-000000000001",
+        "sku": "LAP-DELL-XPS15",
+        "nombre": "Laptop Dell XPS 15 (OLED 4K, i7 13va Gen)",
+        "precio": Decimal("8799.00"),
+        "fecha_inicio": datetime.now(timezone.utc),
+        "fecha_fin": None,
+    }
+}
+
+@router.get("/listas-precios", response_model=List[ListaPrecioResponse])
+async def listar_listas_precios(
+    canal: Optional[str] = Query(None, pattern="^(web|pos|b2b)$"),
+    tipo_cliente: Optional[str] = Query(None, pattern="^(retail|corporativo_b2b)$"),
+    sucursal_id: Optional[str] = None,
+    activo: Optional[bool] = None,
+):
+    """
+    RF-04: Lista las listas de precios diferenciadas configuradas en el sistema.
+    """
+    supabase = get_supabase_client() or get_supabase_admin_client()
+    if supabase:
+        try:
+            q = supabase.table("listas_precios").select("*")
+            if canal:
+                q = q.eq("canal", canal)
+            if tipo_cliente:
+                q = q.eq("tipo_cliente", tipo_cliente)
+            if sucursal_id:
+                q = q.eq("sucursal_id", str(sucursal_id))
+            if activo is not None:
+                q = q.eq("activo", activo)
+            res = q.order("nombre").execute()
+            if res.data and len(res.data) > 0:
+                result = []
+                for row in res.data:
+                    # Contar items
+                    items_res = supabase.table("precios_items").select("id", count="exact").eq("lista_precio_id", row["id"]).execute()
+                    total_items = items_res.count if hasattr(items_res, "count") and items_res.count is not None else 0
+                    suc_nombre = _SUCURSALES_NOMBRES_MAP.get(str(row.get("sucursal_id")), "Sucursal Específica" if row.get("sucursal_id") else "General / Multicanal")
+                    result.append(ListaPrecioResponse(
+                        id=str(row["id"]),
+                        nombre=row["nombre"],
+                        canal=row["canal"],
+                        tipo_cliente=row["tipo_cliente"],
+                        sucursal_id=str(row["sucursal_id"]) if row.get("sucursal_id") else None,
+                        sucursal_nombre=suc_nombre,
+                        moneda=row.get("moneda", "BOB"),
+                        activo=bool(row.get("activo", True)),
+                        total_items=total_items,
+                        items=[],
+                        created_at=row.get("created_at")
+                    ))
+                return result
+        except Exception as e:
+            logger.warning(f"Error consultando listas_precios en Supabase: {e}")
+
+    # Fallback local
+    resultado_local = []
+    for lp in _LOCAL_LISTAS_PRECIOS.values():
+        if canal and lp["canal"] != canal:
+            continue
+        if tipo_cliente and lp["tipo_cliente"] != tipo_cliente:
+            continue
+        if sucursal_id and lp.get("sucursal_id") != sucursal_id:
+            continue
+        if activo is not None and lp.get("activo") != activo:
+            continue
+        items_count = sum(1 for it in _LOCAL_PRECIOS_ITEMS.values() if it["lista_precio_id"] == lp["id"])
+        resultado_local.append(ListaPrecioResponse(
+            id=str(lp["id"]),
+            nombre=lp["nombre"],
+            canal=lp["canal"],
+            tipo_cliente=lp["tipo_cliente"],
+            sucursal_id=lp.get("sucursal_id"),
+            sucursal_nombre=lp.get("sucursal_nombre"),
+            moneda=lp["moneda"],
+            activo=lp["activo"],
+            total_items=items_count,
+            items=[],
+            created_at=lp.get("created_at")
+        ))
+    return resultado_local
+
+@router.post("/listas-precios", response_model=ListaPrecioResponse, status_code=status.HTTP_201_CREATED)
+@require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
+async def crear_lista_precio(
+    payload: ListaPrecioCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    RF-04: Crea una nueva lista de precios diferenciada (Administrador / Gerente Comercial).
+    """
+    new_id = str(uuid4())
+    suc_nombre = payload.sucursal_nombre or _SUCURSALES_NOMBRES_MAP.get(payload.sucursal_id or "", "General / Multicanal")
+    
+    supabase = get_supabase_client() or get_supabase_admin_client()
+    if supabase:
+        try:
+            # Si sucursal_id no es un UUID válido, o si es string simulado
+            clean_sucursal_id = None
+            if payload.sucursal_id:
+                try:
+                    clean_sucursal_id = str(UUID(payload.sucursal_id))
+                except Exception:
+                    clean_sucursal_id = None
+
+            insert_data = {
+                "id": new_id,
+                "nombre": payload.nombre,
+                "canal": payload.canal,
+                "tipo_cliente": payload.tipo_cliente,
+                "sucursal_id": clean_sucursal_id,
+                "moneda": payload.moneda,
+                "activo": payload.activo,
+            }
+            res = supabase.table("listas_precios").insert(insert_data).execute()
+            if res.data and len(res.data) > 0:
+                row = res.data[0]
+                return ListaPrecioResponse(
+                    id=str(row["id"]),
+                    nombre=row["nombre"],
+                    canal=row["canal"],
+                    tipo_cliente=row["tipo_cliente"],
+                    sucursal_id=payload.sucursal_id,
+                    sucursal_nombre=suc_nombre,
+                    moneda=row.get("moneda", payload.moneda),
+                    activo=row.get("activo", True),
+                    total_items=0,
+                    items=[],
+                    created_at=row.get("created_at")
+                )
+        except Exception as e:
+            logger.warning(f"Error insertando en Supabase listas_precios: {e}")
+
+    # Almacenar en local fallback
+    _LOCAL_LISTAS_PRECIOS[new_id] = {
+        "id": new_id,
+        "nombre": payload.nombre,
+        "canal": payload.canal,
+        "tipo_cliente": payload.tipo_cliente,
+        "sucursal_id": payload.sucursal_id,
+        "sucursal_nombre": suc_nombre,
+        "moneda": payload.moneda,
+        "activo": payload.activo,
+        "created_at": datetime.now(timezone.utc)
+    }
+
+    return ListaPrecioResponse(
+        id=new_id,
+        nombre=payload.nombre,
+        canal=payload.canal,
+        tipo_cliente=payload.tipo_cliente,
+        sucursal_id=payload.sucursal_id,
+        sucursal_nombre=suc_nombre,
+        moneda=payload.moneda,
+        activo=payload.activo,
+        total_items=0,
+        items=[],
+        created_at=_LOCAL_LISTAS_PRECIOS[new_id]["created_at"]
+    )
+
+@router.put("/listas-precios/{lista_id}", response_model=ListaPrecioResponse)
+@require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
+async def actualizar_lista_precio(
+    lista_id: str,
+    payload: ListaPrecioUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    RF-04: Actualiza parámetros de una lista de precios existente.
+    """
+    supabase = get_supabase_client() or get_supabase_admin_client()
+    if supabase:
+        try:
+            update_data = {}
+            if payload.nombre is not None: update_data["nombre"] = payload.nombre
+            if payload.canal is not None: update_data["canal"] = payload.canal
+            if payload.tipo_cliente is not None: update_data["tipo_cliente"] = payload.tipo_cliente
+            if payload.moneda is not None: update_data["moneda"] = payload.moneda
+            if payload.activo is not None: update_data["activo"] = payload.activo
+            if update_data:
+                res = supabase.table("listas_precios").update(update_data).eq("id", lista_id).execute()
+                if res.data and len(res.data) > 0:
+                    row = res.data[0]
+                    return ListaPrecioResponse(
+                        id=str(row["id"]),
+                        nombre=row["nombre"],
+                        canal=row["canal"],
+                        tipo_cliente=row["tipo_cliente"],
+                        sucursal_id=str(row["sucursal_id"]) if row.get("sucursal_id") else None,
+                        sucursal_nombre=_SUCURSALES_NOMBRES_MAP.get(str(row.get("sucursal_id")), "General"),
+                        moneda=row.get("moneda", "BOB"),
+                        activo=row.get("activo", True),
+                        total_items=0,
+                        items=[]
+                    )
+        except Exception as e:
+            logger.warning(f"Error actualizando lista de precios en Supabase: {e}")
+
+    if lista_id in _LOCAL_LISTAS_PRECIOS:
+        lp = _LOCAL_LISTAS_PRECIOS[lista_id]
+        if payload.nombre is not None: lp["nombre"] = payload.nombre
+        if payload.canal is not None: lp["canal"] = payload.canal
+        if payload.tipo_cliente is not None: lp["tipo_cliente"] = payload.tipo_cliente
+        if payload.sucursal_id is not None: lp["sucursal_id"] = payload.sucursal_id
+        if payload.sucursal_nombre is not None: lp["sucursal_nombre"] = payload.sucursal_nombre
+        if payload.moneda is not None: lp["moneda"] = payload.moneda
+        if payload.activo is not None: lp["activo"] = payload.activo
+        return ListaPrecioResponse(**lp, total_items=0, items=[])
+
+    raise HTTPException(status_code=404, detail="Lista de precios no encontrada")
+
+@router.delete("/listas-precios/{lista_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
+async def eliminar_lista_precio(
+    lista_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    RF-04: Elimina una lista de precios.
+    """
+    supabase = get_supabase_client() or get_supabase_admin_client()
+    if supabase:
+        try:
+            supabase.table("listas_precios").delete().eq("id", lista_id).execute()
+        except Exception:
+            pass
+
+    if lista_id in _LOCAL_LISTAS_PRECIOS:
+        del _LOCAL_LISTAS_PRECIOS[lista_id]
+        # Limpiar items asociados
+        keys_to_del = [k for k, v in _LOCAL_PRECIOS_ITEMS.items() if v["lista_precio_id"] == lista_id]
+        for k in keys_to_del:
+            del _LOCAL_PRECIOS_ITEMS[k]
+
+    return None
+
+@router.get("/listas-precios/{lista_id}/items", response_model=List[PrecioItemResponse])
+async def listar_items_lista_precio(lista_id: str):
+    """
+    RF-04: Lista las tarifas específicas por variante asignadas a esta lista de precios.
+    """
+    supabase = get_supabase_client() or get_supabase_admin_client()
+    if supabase:
+        try:
+            res = (
+                supabase
+                .table("precios_items")
+                .select("id, lista_precio_id, variante_id, precio, fecha_inicio, fecha_fin, variantes(sku, nombre_variante, productos(nombre))")
+                .eq("lista_precio_id", lista_id)
+                .execute()
+            )
+            if res.data:
+                items = []
+                for r in res.data:
+                    v_data = r.get("variantes") or {}
+                    p_data = v_data.get("productos") or {}
+                    nombre_disp = p_data.get("nombre") or v_data.get("nombre_variante") or "Item"
+                    items.append(PrecioItemResponse(
+                        id=str(r["id"]),
+                        lista_precio_id=str(r["lista_precio_id"]),
+                        variante_id=str(r["variante_id"]),
+                        sku=v_data.get("sku"),
+                        nombre=nombre_disp,
+                        precio=Decimal(str(r["precio"])),
+                        fecha_inicio=r.get("fecha_inicio"),
+                        fecha_fin=r.get("fecha_fin")
+                    ))
+                return items
+        except Exception as e:
+            logger.warning(f"Error listando items de lista_precio en Supabase: {e}")
+
+    # Fallback local
+    items = []
+    for it in _LOCAL_PRECIOS_ITEMS.values():
+        if it["lista_precio_id"] == lista_id:
+            items.append(PrecioItemResponse(
+                id=it["id"],
+                lista_precio_id=it["lista_precio_id"],
+                variante_id=it["variante_id"],
+                sku=it.get("sku"),
+                nombre=it.get("nombre"),
+                precio=it["precio"],
+                fecha_inicio=it.get("fecha_inicio"),
+                fecha_fin=it.get("fecha_fin")
+            ))
+    return items
+
+@router.post("/listas-precios/{lista_id}/items", response_model=PrecioItemResponse, status_code=status.HTTP_201_CREATED)
+@require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
+async def asignar_precio_item(
+    lista_id: str,
+    payload: PrecioItemCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    RF-04: Asigna o actualiza una tarifa específica para una variante en la lista de precios.
+    """
+    new_id = str(uuid4())
+    supabase = get_supabase_client() or get_supabase_admin_client()
+
+    # Obtener SKU / Nombre de referencia
+    sku_ref = "SKU-ITEM"
+    nombre_ref = "Producto Variante"
+    client = _get_supabase_client_safe()
+    universo = _fetch_all_products(client)
+    for p in universo:
+        if str(p.id) == payload.variante_id or any(str(v.id) == payload.variante_id for v in p.variantes):
+            sku_ref = p.sku
+            nombre_ref = p.nombre
+            break
+
+    if supabase:
+        try:
+            upsert_data = {
+                "lista_precio_id": lista_id,
+                "variante_id": payload.variante_id,
+                "precio": float(payload.precio),
+                "fecha_inicio": payload.fecha_inicio.isoformat() if payload.fecha_inicio else datetime.now(timezone.utc).isoformat(),
+                "fecha_fin": payload.fecha_fin.isoformat() if payload.fecha_fin else None
+            }
+            res = supabase.table("precios_items").upsert(upsert_data, on_conflict="lista_precio_id,variante_id").execute()
+            if res.data and len(res.data) > 0:
+                row = res.data[0]
+                return PrecioItemResponse(
+                    id=str(row["id"]),
+                    lista_precio_id=str(row["lista_precio_id"]),
+                    variante_id=str(row["variante_id"]),
+                    sku=sku_ref,
+                    nombre=nombre_ref,
+                    precio=Decimal(str(row["precio"])),
+                    fecha_inicio=row.get("fecha_inicio"),
+                    fecha_fin=row.get("fecha_fin")
+                )
+        except Exception as e:
+            logger.warning(f"Error upsert precios_items en Supabase: {e}")
+
+    # Local fallback
+    item_key = f"{lista_id}_{payload.variante_id}"
+    _LOCAL_PRECIOS_ITEMS[item_key] = {
+        "id": new_id,
+        "lista_precio_id": lista_id,
+        "variante_id": payload.variante_id,
+        "sku": sku_ref,
+        "nombre": nombre_ref,
+        "precio": payload.precio,
+        "fecha_inicio": payload.fecha_inicio or datetime.now(timezone.utc),
+        "fecha_fin": payload.fecha_fin
+    }
+
+    return PrecioItemResponse(
+        id=new_id,
+        lista_precio_id=lista_id,
+        variante_id=payload.variante_id,
+        sku=sku_ref,
+        nombre=nombre_ref,
+        precio=payload.precio,
+        fecha_inicio=_LOCAL_PRECIOS_ITEMS[item_key]["fecha_inicio"],
+        fecha_fin=_LOCAL_PRECIOS_ITEMS[item_key]["fecha_fin"]
+    )
+
+@router.delete("/listas-precios/{lista_id}/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
+async def eliminar_precio_item(
+    lista_id: str,
+    item_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    supabase = get_supabase_client() or get_supabase_admin_client()
+    if supabase:
+        try:
+            supabase.table("precios_items").delete().eq("id", item_id).execute()
+        except Exception:
+            pass
+
+    # Local fallback
+    keys_to_del = [k for k, v in _LOCAL_PRECIOS_ITEMS.items() if v["id"] == item_id or k == item_id]
+    for k in keys_to_del:
+        del _LOCAL_PRECIOS_ITEMS[k]
+
+    return None
+
+# ==============================================================================
+# MOTOR JERÁRQUICO DE RESOLUCIÓN DE PRECIOS (US-04 / RF-04)
+# Priorización: Cliente B2B > Sucursal Específica > Canal General > Base Catálogo
+# ==============================================================================
 @router.get(
     "/precios/resolver",
     response_model=PrecioResolucionResponse
 )
 async def resolver_precio(
-    variante_id: UUID,
+    variante_id: str,
     canal: str = Query(..., pattern="^(web|pos|b2b)$"),
     tipo_cliente: str = Query(
         "retail",
         pattern="^(retail|corporativo_b2b)$"
     ),
-    sucursal_id: Optional[UUID] = None
+    sucursal_id: Optional[str] = None
 ):
     """
-    KAN-297:
-    Resuelve el precio vigente de una variante según:
-    - canal
-    - tipo de cliente
-    - sucursal
-    - vigencia
+    US-04 / RF-04:
+    Motor jerárquico de resolución de precios diferenciados:
+    1. Si tipo_cliente == 'corporativo_b2b', busca primero lista B2B preferencial.
+    2. Si se especifica sucursal_id, busca lista activa de esa sucursal en el canal dado.
+    3. Si no, busca lista general del canal (sin sucursal asociada).
+    4. Fallback: Precio base de la variante o producto del catálogo.
     """
-    supabase = get_supabase_client() or get_supabase_admin_client()
-
     ahora = datetime.now(timezone.utc)
+    variante_str = str(variante_id)
 
-    if supabase is None:
-        logger.warning("Supabase no disponible, usando fallback simulado para resolver_precio.")
-        return PrecioResolucionResponse(
-            lista_precio_id=uuid4(),
-            lista_nombre=f"Lista Estándar ({canal.upper()} - {tipo_cliente})",
-            variante_id=variante_id,
-            precio=Decimal("150.00"),
-            moneda="BOB",
-            canal=canal,
-            tipo_cliente=tipo_cliente,
-            sucursal_id=sucursal_id,
-            fecha_inicio=ahora.isoformat(),
-            fecha_fin=None
-        )
+    # 1. Obtener todas las listas activas candidatas ordenadas por jerarquía
+    listas_candidatas: List[Dict[str, Any]] = []
 
-    # Buscar listas de precios activas que coincidan
-    # con canal, tipo de cliente y sucursal.
-    query = (
-        supabase
-        .table("listas_precios")
-        .select(
-            "id,nombre,canal,tipo_cliente,sucursal_id,moneda,activo"
-        )
-        .eq("canal", canal)
-        .eq("tipo_cliente", tipo_cliente)
-        .eq("activo", True)
+    supabase = get_supabase_client() or get_supabase_admin_client()
+    if supabase:
+        try:
+            res = supabase.table("listas_precios").select("*").eq("activo", True).execute()
+            if res.data:
+                listas_candidatas = res.data
+        except Exception as e:
+            logger.warning(f"Error consultando listas en resolver_precio: {e}")
+
+    if not listas_candidatas:
+        listas_candidatas = list(_LOCAL_LISTAS_PRECIOS.values())
+
+    # Ordenar por especificidad / jerarquía según US-04:
+    # 1º: Reglas corporativo B2B
+    # 2º: Reglas con sucursal específica coincidente
+    # 3º: Reglas de canal general
+    def calcular_peso_prioridad(lp: Dict[str, Any]) -> int:
+        peso = 0
+        lp_canal = lp.get("canal")
+        lp_tipo = lp.get("tipo_cliente")
+        lp_sucursal = lp.get("sucursal_id")
+
+        if tipo_cliente == "corporativo_b2b" and lp_tipo == "corporativo_b2b":
+            peso += 100
+        if sucursal_id and lp_sucursal and str(lp_sucursal) == str(sucursal_id):
+            peso += 50
+        if lp_canal == canal:
+            peso += 20
+        if not lp_sucursal: # Canal general
+            peso += 10
+        return peso
+
+    listas_ordenadas = sorted(
+        [l for l in listas_candidatas if l.get("activo", True)],
+        key=calcular_peso_prioridad,
+        reverse=True
     )
 
-    if sucursal_id:
-        query = query.eq("sucursal_id", str(sucursal_id))
+    # Buscar tarifa para la variante en las listas ordenadas por prioridad
+    for lista in listas_ordenadas:
+        l_id = str(lista["id"])
 
-    listas_response = query.execute()
-
-    listas = listas_response.data or []
-
-    if not listas:
-        raise HTTPException(
-            status_code=404,
-            detail="No existe una lista de precios activa para los criterios indicados."
-        )
-
-    # Buscar el precio vigente para la variante.
-    for lista in listas:
-        precios_response = (
-            supabase
-            .table("precios_items")
-            .select(
-                "lista_precio_id,variante_id,precio,fecha_inicio,fecha_fin"
-            )
-            .eq("lista_precio_id", lista["id"])
-            .eq("variante_id", str(variante_id))
-            .execute()
-        )
-
-        precios = precios_response.data or []
-
-        for item in precios:
-            fecha_inicio = datetime.fromisoformat(
-                item["fecha_inicio"].replace("Z", "+00:00")
-            )
-
-            fecha_fin = None
-
-            if item.get("fecha_fin"):
-                fecha_fin = datetime.fromisoformat(
-                    item["fecha_fin"].replace("Z", "+00:00")
+        # Intentar en Supabase
+        if supabase:
+            try:
+                precios_res = (
+                    supabase
+                    .table("precios_items")
+                    .select("*")
+                    .eq("lista_precio_id", l_id)
+                    .eq("variante_id", variante_str)
+                    .execute()
                 )
+                if precios_res.data:
+                    for item in precios_res.data:
+                        f_inicio = datetime.fromisoformat(item["fecha_inicio"].replace("Z", "+00:00")) if item.get("fecha_inicio") else ahora
+                        f_fin = datetime.fromisoformat(item["fecha_fin"].replace("Z", "+00:00")) if item.get("fecha_fin") else None
+                        if f_inicio <= ahora and (f_fin is None or ahora <= f_fin):
+                            return PrecioResolucionResponse(
+                                lista_precio_id=UUID(l_id) if len(l_id) == 36 else uuid4(),
+                                lista_nombre=lista["nombre"],
+                                variante_id=UUID(variante_str) if len(variante_str) == 36 else uuid4(),
+                                precio=Decimal(str(item["precio"])),
+                                moneda=lista.get("moneda", "BOB"),
+                                canal=lista["canal"],
+                                tipo_cliente=lista["tipo_cliente"],
+                                sucursal_id=UUID(str(lista["sucursal_id"])) if lista.get("sucursal_id") and len(str(lista["sucursal_id"])) == 36 else None,
+                                fecha_inicio=item.get("fecha_inicio", ahora.isoformat()),
+                                fecha_fin=item.get("fecha_fin")
+                            )
+            except Exception:
+                pass
 
-            if fecha_inicio <= ahora and (
-                fecha_fin is None or ahora <= fecha_fin
-            ):
+        # Intentar en almacenamiento local
+        for it in _LOCAL_PRECIOS_ITEMS.values():
+            if str(it["lista_precio_id"]) == l_id and str(it["variante_id"]) == variante_str:
                 return PrecioResolucionResponse(
-                    lista_precio_id=lista["id"],
+                    lista_precio_id=UUID(l_id) if len(l_id) == 36 else uuid4(),
                     lista_nombre=lista["nombre"],
-                    variante_id=item["variante_id"],
-                    precio=Decimal(str(item["precio"])),
-                    moneda=lista["moneda"],
+                    variante_id=UUID(variante_str) if len(variante_str) == 36 else uuid4(),
+                    precio=Decimal(str(it["precio"])),
+                    moneda=lista.get("moneda", "BOB"),
                     canal=lista["canal"],
                     tipo_cliente=lista["tipo_cliente"],
-                    sucursal_id=lista.get("sucursal_id"),
-                    fecha_inicio=item["fecha_inicio"],
-                    fecha_fin=item.get("fecha_fin")
+                    sucursal_id=None,
+                    fecha_inicio=ahora.isoformat(),
+                    fecha_fin=None
                 )
 
-    raise HTTPException(
-        status_code=404,
-        detail="No existe un precio vigente para la variante indicada."
+    # 4. Fallback a precio base del catálogo
+    client = _get_supabase_client_safe()
+    universo = _fetch_all_products(client)
+    for p in universo:
+        if str(p.id) == variante_str or any(str(v.id) == variante_str for v in p.variantes):
+            precio_base = Decimal(str(p.precio or "100.00"))
+            # Si es corporativo_b2b y no hay lista explícita, aplicar 10% de tarifa mayorista estándar
+            if tipo_cliente == "corporativo_b2b":
+                precio_base = (precio_base * Decimal("0.90")).quantize(Decimal("0.01"))
+            return PrecioResolucionResponse(
+                lista_precio_id=uuid4(),
+                lista_nombre=f"Tarifa Base Catálogo ({canal.upper()} - {tipo_cliente})",
+                variante_id=UUID(variante_str) if len(variante_str) == 36 else uuid4(),
+                precio=precio_base,
+                moneda="BOB",
+                canal=canal,
+                tipo_cliente=tipo_cliente,
+                sucursal_id=None,
+                fecha_inicio=ahora.isoformat(),
+                fecha_fin=None
+            )
+
+    # Fallback genérico final
+    return PrecioResolucionResponse(
+        lista_precio_id=uuid4(),
+        lista_nombre=f"Lista Estándar ({canal.upper()} - {tipo_cliente})",
+        variante_id=UUID(variante_str) if len(variante_str) == 36 else uuid4(),
+        precio=Decimal("150.00"),
+        moneda="BOB",
+        canal=canal,
+        tipo_cliente=tipo_cliente,
+        sucursal_id=None,
+        fecha_inicio=ahora.isoformat(),
+        fecha_fin=None
     )

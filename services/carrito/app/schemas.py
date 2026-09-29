@@ -63,3 +63,7 @@ class WishlistResponse(BaseModel):
     cliente_id: UUID
     variante_id: UUID
     created_at: datetime
+    sku: Optional[str] = None
+    nombre: Optional[str] = None
+    precio: Optional[Decimal] = None
+    imagen_url: Optional[str] = None

@@ -2,7 +2,7 @@ import os
 import logging
 import json
 import httpx
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from fastapi import FastAPI, Request, Response, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -70,9 +70,9 @@ async def health_check():
 # ------------------------------------------------------------------------------
 # PROXY INVERSO / REENVÍO A MICROSERVICIOS
 # ------------------------------------------------------------------------------
-async def forward_request(target_base_url: str, request: Request) -> Response:
+async def forward_request(target_base_url: str, request: Request, custom_path: Optional[str] = None) -> Response:
     """Reenvía la petición al microservicio correspondiente preservando headers y body."""
-    path = request.url.path
+    path = custom_path if custom_path is not None else request.url.path
     query = request.url.query
     url = f"{target_base_url}{path}"
     if query:
@@ -178,6 +178,14 @@ async def proxy_clientes(path: str, request: Request):
 async def proxy_ordenes(path: str, request: Request):
     return await forward_request(settings.MS_ORDENES_URL, request)
 
+@app.api_route("/api/v1/facturacion/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], tags=["Facturación Electrónica Legal"])
+async def proxy_facturacion(path: str, request: Request):
+    return await forward_request(settings.MS_ORDENES_URL, request)
+
+@app.api_route("/api/v1/facturacion", methods=["GET", "POST"], tags=["Facturación Electrónica Legal"])
+async def proxy_facturacion_root(request: Request):
+    return await forward_request(settings.MS_ORDENES_URL, request)
+
 @app.api_route("/api/v1/reportes/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], tags=["Reportes y Analítica"])
 async def proxy_reportes(
     path: str,
@@ -185,3 +193,12 @@ async def proxy_reportes(
     current_user: Dict[str, Any] = Depends(require_role(["administrador", "gerente_comercial"])),
 ):
     return await forward_request(settings.MS_REPORTES_URL, request)
+
+# Aliases de compatibilidad hacia atrás
+@app.api_route("/productos/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+async def proxy_productos_legacy_alias(path: str, request: Request):
+    return await forward_request(settings.MS_CATALOGO_URL, request, custom_path=f"/api/v1/catalogo/productos/{path}")
+
+@app.api_route("/productos", methods=["GET", "POST"], include_in_schema=False)
+async def proxy_productos_root_legacy_alias(request: Request):
+    return await forward_request(settings.MS_CATALOGO_URL, request, custom_path="/api/v1/catalogo/productos")

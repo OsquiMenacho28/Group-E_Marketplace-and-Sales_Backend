@@ -126,7 +126,7 @@ def _create_token_response(user_data: Dict[str, Any], perfil: PerfilResponse) ->
 async def registrar_cliente(payload: ClienteRegistro):
     """
     RF-22: Registro de nuevo cliente con hash de contraseña, bono de 50 puntos y sincronización a CRM.
-    Emite tokens JWT de acceso y refresco.
+    Valida y persiste tanto en Supabase Auth como en PostgreSQL (perfiles_clientes y puntos_fidelidad).
     """
     email_clean = payload.email.lower().strip()
     if email_clean in _USERS_DB:
@@ -135,29 +135,62 @@ async def registrar_cliente(payload: ClienteRegistro):
             detail="Ya existe una cuenta registrada con este correo electrónico."
         )
 
+    admin_supabase = get_supabase_admin_client()
+    if admin_supabase:
+        try:
+            exist_check = admin_supabase.table("perfiles_clientes").select("id").eq("email", email_clean).limit(1).execute()
+            if exist_check.data and len(exist_check.data) > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Ya existe una cuenta registrada con este correo electrónico."
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Aviso al validar unicidad en Supabase: {e}")
+
     cliente_id = uuid.uuid4()
     user_id = cliente_id
 
-    # Intentar registro en Supabase Auth si está conectado
-    supabase = get_supabase_client()
-    if supabase:
+    # Registrar en Supabase Auth directo con confirmación de correo
+    if admin_supabase:
         try:
-            sb_res = supabase.auth.sign_up({
+            sb_user = admin_supabase.auth.admin.create_user({
                 "email": email_clean,
                 "password": payload.password,
-                "options": {
-                    "data": {
-                        "nombre_completo": payload.nombre_completo,
-                        "role": "cliente"
-                    }
+                "email_confirm": True,
+                "user_metadata": {
+                    "nombre_completo": payload.nombre_completo,
+                    "role": "cliente"
                 }
             })
-            if sb_res and sb_res.user:
-                user_id = uuid.UUID(sb_res.user.id)
+            if sb_user and sb_user.user:
+                user_id = uuid.UUID(sb_user.user.id)
         except Exception as e:
-            logger.warning(f"No se pudo registrar en Supabase Auth directo (modo local fallback): {e}")
+            logger.warning(f"Aviso al registrar en Supabase Auth: {e}")
 
-    # Guardar en estructura de datos
+        # Persistir perfil y puntos en PostgreSQL (perfiles_clientes y puntos_fidelidad)
+        try:
+            admin_supabase.table("perfiles_clientes").insert({
+                "id": str(cliente_id),
+                "user_id": str(user_id) if user_id else None,
+                "nombre_completo": payload.nombre_completo,
+                "email": email_clean,
+                "telefono": payload.telefono,
+                "nit_ci": payload.nit_ci,
+                "razon_social": payload.razon_social,
+                "tipo_cliente": payload.tipo_cliente or "retail"
+            }).execute()
+
+            admin_supabase.table("puntos_fidelidad").insert({
+                "cliente_id": str(cliente_id),
+                "puntos_saldo": 50
+            }).execute()
+            logger.info(f"Cliente {email_clean} guardado en tablas PostgreSQL perfiles_clientes y puntos_fidelidad.")
+        except Exception as e:
+            logger.error(f"Error al persistir cliente en tablas de Supabase: {e}")
+
+    # Guardar en estructura de datos en memoria para acceso ultrarrápido
     user_record = {
         "id": cliente_id,
         "user_id": user_id,
@@ -214,12 +247,14 @@ async def login_usuario(payload: ClienteLogin):
     email_clean = payload.email.lower().strip()
     user_record = _USERS_DB.get(email_clean)
 
-    # Si no está en memoria local, verificar en Supabase Auth si está configurado
+    # Si no está en memoria local, verificar en Supabase Auth y base de datos
     if not user_record:
-        supabase = get_supabase_client()
-        if supabase:
+        admin_supabase = get_supabase_admin_client()
+        pub_supabase = get_supabase_client()
+        supabase_auth_client = pub_supabase or admin_supabase
+        if supabase_auth_client:
             try:
-                auth_resp = supabase.auth.sign_in_with_password({
+                auth_resp = supabase_auth_client.auth.sign_in_with_password({
                     "email": email_clean,
                     "password": payload.password
                 })
@@ -229,16 +264,44 @@ async def login_usuario(payload: ClienteLogin):
                     u_meta = u.user_metadata or {}
                     app_meta = getattr(u, "app_metadata", {}) or {}
                     role = app_meta.get("role") or u_meta.get("role") or "cliente"
-                    
+                    nombre = u_meta.get("nombre_completo", email_clean.split("@")[0])
+                    puntos = 50
+                    telefono = None
+                    nit_ci = None
+                    razon_social = None
+                    tipo_cliente = "retail"
+
+                    if admin_supabase:
+                        try:
+                            db_profile = admin_supabase.table("perfiles_clientes").select("*, puntos_fidelidad(puntos_saldo)").eq("email", email_clean).limit(1).execute()
+                            if db_profile.data and len(db_profile.data) > 0:
+                                p_row = db_profile.data[0]
+                                uid = uuid.UUID(p_row["id"])
+                                nombre = p_row.get("nombre_completo") or nombre
+                                telefono = p_row.get("telefono")
+                                nit_ci = p_row.get("nit_ci")
+                                razon_social = p_row.get("razon_social")
+                                tipo_cliente = p_row.get("tipo_cliente") or "retail"
+                                pts_data = p_row.get("puntos_fidelidad")
+                                if isinstance(pts_data, list) and len(pts_data) > 0:
+                                    puntos = pts_data[0].get("puntos_saldo", 50)
+                                elif isinstance(pts_data, dict):
+                                    puntos = pts_data.get("puntos_saldo", 50)
+                        except Exception as dbe:
+                            logger.warning(f"Aviso consultando perfil en BD: {dbe}")
+
                     user_record = {
                         "id": uid,
                         "user_id": uid,
                         "email": email_clean,
                         "password_hash": "",
-                        "nombre_completo": u_meta.get("nombre_completo", email_clean.split("@")[0]),
+                        "nombre_completo": nombre,
+                        "telefono": telefono,
+                        "nit_ci": nit_ci,
+                        "razon_social": razon_social,
                         "role": role,
-                        "tipo_cliente": "retail",
-                        "puntos_saldo": 50,
+                        "tipo_cliente": tipo_cliente,
+                        "puntos_saldo": puntos,
                         "sucursal_id": app_meta.get("sucursal_id")
                     }
                     _USERS_DB[email_clean] = user_record

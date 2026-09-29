@@ -27,6 +27,11 @@ El proyecto abarca una solución omnicanal completa (canales digitales y puntos 
    - Estructura WBS (Nivel 1 y 2), matriz de dependencias Finish-to-Start, enlace a Jira y cronograma de ejecución.
 8. **[08 - Plan de Sprints e Historias de Usuario para Jira](./08-historias-de-usuario-jira.md)**
    - Catálogo de las 50 Historias de Usuario distribuidas en 4 Sprints, con criterios de aceptación y subtareas de desarrollo estimadas en horas.
+9. **[09 - Bitácora de Cambios Técnicos — Rama `ft-reservar`](./09-bitacora-cambios-ft-reservar.md)**
+   - Auditoría completa de cambios desde la versión base (`version1`): modelos, endpoints, stores, UI de checkout con TTL 15 min, contratos RIO y pruebas automatizadas.
+10. **[10 - Bitácora de Cambios Técnicos — Búsqueda Facetada (US-06 / RF-06)](./10-bitacora-cambios-ft-busqueda-facetada.md)**
+   - Motor de búsqueda Full-Text Search insensible a tildes, índices GIN en PostgreSQL, endpoints de agregación facetada, autocompletado predictivo (*typeahead*) y panel lateral interactivo en Vue 3.
+
 
 ---
 

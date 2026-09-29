@@ -8,7 +8,8 @@ logger = logging.getLogger("maxiconecta.erp")
 class BaseERPClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip('/')
-        self.timeout = settings.ERP_TIMEOUT_SECONDS
+        # En desarrollo o pruebas usar timeout ágil (1s) para fallback inmediato
+        self.timeout = 1.0 if settings.ENVIRONMENT in ("testing", "development") else settings.ERP_TIMEOUT_SECONDS
 
     async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"

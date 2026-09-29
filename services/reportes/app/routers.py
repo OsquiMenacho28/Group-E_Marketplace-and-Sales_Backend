@@ -1,7 +1,10 @@
 from decimal import Decimal
 from typing import List, Optional
 from fastapi import APIRouter, Query
-from app.schemas import KPIDashboardResponse, ReporteVentasItem, AnaliticaEmbudoResponse, EmbudoConversionEtapa
+try:
+    from app.schemas import KPIDashboardResponse, ReporteVentasItem, AnaliticaEmbudoResponse, EmbudoConversionEtapa
+except (ModuleNotFoundError, ImportError):
+    from backend.services.reportes.app.schemas import KPIDashboardResponse, ReporteVentasItem, AnaliticaEmbudoResponse, EmbudoConversionEtapa
 
 router = APIRouter(prefix="/api/v1/reportes", tags=["Reportes y Analítica"])
 

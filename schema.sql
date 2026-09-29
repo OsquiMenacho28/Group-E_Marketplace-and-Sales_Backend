@@ -5,8 +5,6 @@
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-CREATE EXTENSION IF NOT EXISTS "unaccent";
-CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
 -- ------------------------------------------------------------------------------
 -- ENUMS Y TIPOS DE DATOS
@@ -244,6 +242,30 @@ CREATE TABLE IF NOT EXISTS pagos (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Facturación Electrónica en Línea (RF-10, RF-45, KAN-346, KAN-367)
+CREATE TABLE IF NOT EXISTS facturas (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    orden_id UUID REFERENCES ordenes(id) ON DELETE CASCADE,
+    numero_factura BIGINT NOT NULL,
+    cuf VARCHAR(100) NOT NULL UNIQUE,
+    cufd VARCHAR(100),
+    nit_emisor VARCHAR(50) NOT NULL DEFAULT '1028374029',
+    nit_ci_cliente VARCHAR(50) NOT NULL,
+    razon_social_cliente VARCHAR(200) NOT NULL,
+    email_cliente VARCHAR(150),
+    monto_total NUMERIC(12, 2) NOT NULL CHECK (monto_total >= 0),
+    monto_iva NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (monto_iva >= 0),
+    modalidad VARCHAR(50) DEFAULT 'electronica_en_linea',
+    estado VARCHAR(50) DEFAULT 'emitida',
+    codigo_qr TEXT,
+    items JSONB DEFAULT '[]'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_facturas_cuf ON facturas(cuf);
+CREATE INDEX IF NOT EXISTS idx_facturas_orden ON facturas(orden_id);
+CREATE INDEX IF NOT EXISTS idx_facturas_cliente ON facturas(nit_ci_cliente);
+
 CREATE TABLE IF NOT EXISTS devoluciones (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     orden_id UUID NOT NULL REFERENCES ordenes(id),
@@ -298,26 +320,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 -- Índices de alto rendimiento
 CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos(categoria_id);
 CREATE INDEX IF NOT EXISTS idx_productos_estado ON productos(estado);
-CREATE INDEX IF NOT EXISTS idx_productos_marca ON productos(marca);
 CREATE INDEX IF NOT EXISTS idx_variantes_producto ON variantes(producto_id);
-CREATE INDEX IF NOT EXISTS idx_variantes_precio ON variantes(precio);
 CREATE INDEX IF NOT EXISTS idx_ordenes_cliente ON ordenes(cliente_id);
 CREATE INDEX IF NOT EXISTS idx_ordenes_estado ON ordenes(estado);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
-
--- ------------------------------------------------------------------------------
--- SOPORTE FULL-TEXT SEARCH (FTS) Y BÚSQUEDA FACETADA (RF-06 / US-06)
--- ------------------------------------------------------------------------------
-ALTER TABLE productos ADD COLUMN IF NOT EXISTS search_vector tsvector 
-    GENERATED ALWAYS AS (
-        to_tsvector('spanish', 
-            coalesce(nombre, '') || ' ' || 
-            coalesce(marca, '') || ' ' || 
-            coalesce(sku, '') || ' ' || 
-            coalesce(descripcion, '')
-        )
-    ) STORED;
-
-CREATE INDEX IF NOT EXISTS idx_productos_fts_gin ON productos USING GIN (search_vector);
-CREATE INDEX IF NOT EXISTS idx_productos_nombre_trgm ON productos USING GIN (nombre gin_trgm_ops);
-

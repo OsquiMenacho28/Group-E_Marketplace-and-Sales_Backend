@@ -172,14 +172,14 @@ class BusquedaStockResponse(BaseModel):
     origen_cache: bool = False
 
 class PrecioResolucionResponse(BaseModel):
-    lista_precio_id: UUID
+    lista_precio_id: Optional[str] = None
     lista_nombre: str
-    variante_id: UUID
+    variante_id: str
     precio: Decimal
     moneda: str
     canal: str
     tipo_cliente: str
-    sucursal_id: Optional[UUID] = None
+    sucursal_id: Optional[str] = None
     fecha_inicio: str
     fecha_fin: Optional[str] = None
 

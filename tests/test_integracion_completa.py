@@ -219,3 +219,26 @@ def test_catalogo_resolucion_precios_michelle():
     assert "precio" in data and float(data["precio"]) > 0
     assert data["moneda"] == "BOB"
 
+
+def test_catalogo_resolucion_precios_lote_por_sucursal():
+    """RF-04: la tarifa POS de Sucursal Central solo aplica en esa sucursal; en otra se usa el precio base."""
+    producto_id = "20000000-0000-0000-0000-000000000001"
+    base = "/api/v1/catalogo/precios/resolver-lote"
+    central = catalogo_client.get(base, params={"variante_ids": producto_id, "canal": "pos", "sucursal_id": "SUC-LP-CENTRAL"})
+    otra = catalogo_client.get(base, params={"variante_ids": producto_id, "canal": "pos", "sucursal_id": "SUC-CBB-CENTRO"})
+    web = catalogo_client.get(base, params={"variante_ids": producto_id, "canal": "web", "sucursal_id": "SUC-LP-CENTRAL"})
+
+    assert central.status_code == otra.status_code == web.status_code == 200
+    assert float(central.json()[producto_id]["precio"]) == 8799.00
+    assert central.json()[producto_id]["sucursal_id"] == "SUC-LP-CENTRAL"
+    assert float(otra.json()[producto_id]["precio"]) == 8999.00
+    assert float(web.json()[producto_id]["precio"]) == 8999.00
+
+
+def test_fecha_tarifa_acepta_fracciones_de_supabase():
+    from backend.services.catalogo.app.routers import _fecha_tarifa
+
+    assert _fecha_tarifa("2026-09-29T23:48:18.64576+00:00").microsecond == 645760
+    assert _fecha_tarifa("2026-09-29T23:48:18.1Z").microsecond == 100000
+    assert _fecha_tarifa("2026-09-29T23:48:18+00:00").second == 18
+

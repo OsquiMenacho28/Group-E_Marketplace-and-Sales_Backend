@@ -18,6 +18,8 @@ from backend.shared.redis_client import (
     crear_reserva_stock, consultar_reserva, liberar_reserva_stock,
     confirmar_reserva_stock, save_cart_to_cache
 )
+from backend.shared.erp_clients.inventarios import InventariosClient
+from backend.shared import stock_ledger
 
 carrito_client = TestClient(carrito_app)
 ordenes_client = TestClient(ordenes_app)
@@ -147,6 +149,44 @@ def test_reserva_stock_flujo_completo():
     print("\n" + "=" * 70)
     print("TODAS LAS PRUEBAS DE US-14 (RF-14) PASARON CON ÉXITO")
     print("=" * 70)
+
+
+def test_fallback_inventario_rechaza_sobreventa_y_libera_stock(monkeypatch):
+    client = InventariosClient()
+
+    async def fallback_post(path, payload):
+        return {"status": "fallback"}
+
+    monkeypatch.setattr(client, "post", fallback_post)
+    sku = f"TEST-STOCK-{uuid.uuid4()}"
+    asyncio.run(stock_ledger.register_base_stock(sku, 3))
+
+    reservation = asyncio.run(client.reservar_stock([{"sku": sku, "cantidad": 3}], 900))
+    assert reservation["status"] == "CONFIRMADA"
+    assert asyncio.run(stock_ledger.available_stock(sku)) == 0
+
+    rejected = asyncio.run(client.reservar_stock([{"sku": sku, "cantidad": 1}], 900))
+    assert rejected["status"] == "RECHAZADA"
+
+    asyncio.run(client.liberar_reserva(reservation["reserva_id"], []))
+    assert asyncio.run(stock_ledger.available_stock(sku)) == 3
+
+    sale = asyncio.run(client.reservar_stock([{"sku": sku, "cantidad": 2}], 900))
+    asyncio.run(client.descuento_definitivo(sale["reserva_id"], str(uuid.uuid4())))
+    assert asyncio.run(stock_ledger.available_stock(sku)) == 1
+
+
+def test_carrito_rechaza_cantidad_mayor_al_stock():
+    sku = f"TEST-CART-{uuid.uuid4()}"
+    asyncio.run(stock_ledger.register_base_stock(sku, 2))
+    cart_id = str(uuid.uuid4())
+    item = {"variante_id": str(uuid.uuid4()), "sku": sku, "nombre": "Prueba", "cantidad": 2, "precio_unitario": 10}
+
+    assert carrito_client.post(f"/api/v1/carrito/{cart_id}/items", json=item).status_code == 200
+    resp_exceso = carrito_client.post(f"/api/v1/carrito/{cart_id}/items", json={**item, "cantidad": 1})
+    assert resp_exceso.status_code == 409
+    resp_update = carrito_client.put(f"/api/v1/carrito/{cart_id}/items/{item['variante_id']}", json={"cantidad": 3})
+    assert resp_update.status_code == 409
 
 if __name__ == "__main__":
     test_reserva_stock_flujo_completo()

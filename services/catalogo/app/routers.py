@@ -8,7 +8,7 @@ import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
@@ -72,8 +72,9 @@ except (ModuleNotFoundError, ImportError):
         PrecioItemResponse,
     )
 
-from backend.shared.database import get_supabase_admin_client, get_supabase_client
+from backend.shared.database import get_supabase_admin_client
 from backend.shared.erp_clients.inventarios import inventarios_client
+from backend.shared import stock_ledger
 from backend.shared.redis_client import get_stock_cache, set_stock_cache, STOCK_CACHE_TTL_SECONDS
 from backend.shared.security import get_current_user, require_jwt_claims
 
@@ -391,11 +392,36 @@ def _fetch_all_products(client: Optional[Any] = None, q: Optional[str] = None) -
                     pass
             rows = db_query.execute().data or []
             if rows:
-                return [_product_response_from_db(client, r) for r in rows]
+                remote_products = [_product_response_from_db(client, r) for r in rows]
+                remote_ids = {str(product.id) for product in remote_products}
+                local_fallback = [
+                    _build_product_response(product)
+                    for product in _LOCAL_PRODUCTOS.values()
+                    if str(product["id"]) not in remote_ids
+                ]
+                return remote_products + local_fallback
         except Exception as e:
             logger.warning(f"Error consultando productos de Supabase: {e}. Usando catálogo local.")
 
     return [_build_product_response(p) for p in _LOCAL_PRODUCTOS.values()]
+
+
+def _buscar_producto_por_sku(sku: str) -> Optional[ProductoResponse]:
+    for producto in _fetch_all_products(_get_supabase_client_safe()):
+        if producto.sku == sku or any(v.sku == sku for v in producto.variantes):
+            return producto
+    return None
+
+
+async def _aplicar_stock_disponible(productos: List[ProductoResponse]) -> None:
+    """Reemplaza el stock nominal del catálogo por las unidades realmente disponibles."""
+    async def actualizar(producto: ProductoResponse) -> None:
+        if await stock_ledger.get_base_stock(producto.sku) is None:
+            await stock_ledger.register_base_stock(producto.sku, int(producto.stock or 0))
+        data = await inventarios_client.consultar_disponibilidad(producto.sku)
+        producto.stock = int(data.get("stock_disponible", 0))
+
+    await asyncio.gather(*(actualizar(producto) for producto in productos))
 
 
 def _decode_image(data_url: str) -> tuple[str, bytes]:
@@ -700,6 +726,7 @@ async def buscar_productos_facetados(
     total_coincidencias = len(filtered_items)
     offset = (pagina - 1) * limite
     paginated_items = filtered_items[offset : offset + limite]
+    await _aplicar_stock_disponible(paginated_items)
 
     return BusquedaFacetadaResponse(
         items=paginated_items,
@@ -806,7 +833,9 @@ async def obtener_productos_recomendados(
         resto.sort(key=lambda p: (0 if (p.stock or 0) > 0 else 1, -(p.stock or 0)))
         recomendados.extend(resto[: limite - len(recomendados)])
 
-    return recomendados[:limite]
+    recomendados = recomendados[:limite]
+    await _aplicar_stock_disponible(recomendados)
+    return recomendados
 
 
 # ------------------------------------------------------------------------------
@@ -1645,6 +1674,11 @@ async def consultar_stock(sku: str, sucursal_id: Optional[str] = None):
     if cacheado is not None:
         return StockDisponibilidadResponse(**cacheado, origen="cache")
 
+    if await stock_ledger.get_base_stock(sku) is None:
+        producto = _buscar_producto_por_sku(sku)
+        if producto:
+            await stock_ledger.register_base_stock(sku, int(producto.stock or 0))
+
     data = await inventarios_client.consultar_disponibilidad(sku, sucursal_id)
     resultado = {
         "sku": sku,
@@ -1666,6 +1700,103 @@ _SUCURSALES_NOMBRES_MAP = {
     "SUC-SCZ-EQUIPETROL": "Sucursal Equipetrol - Santa Cruz",
     "SUC-CBB-CENTRO": "Sucursal Centro - Cochabamba"
 }
+
+# listas_precios.sucursal_id es UUID en Supabase: los códigos de sucursal se guardan como UUID deterministas.
+_SUCURSAL_NAMESPACE = UUID("5b0f7c3e-2d4a-4c8e-9f1b-7a6d3e2c1b90")
+_SUCURSAL_UUIDS = {codigo: str(uuid5(_SUCURSAL_NAMESPACE, codigo)) for codigo in _SUCURSALES_NOMBRES_MAP}
+_SUCURSAL_CODIGOS = {valor: codigo for codigo, valor in _SUCURSAL_UUIDS.items()}
+
+
+def _sucursal_a_db(sucursal_id: Optional[str]) -> Optional[str]:
+    if not sucursal_id:
+        return None
+    if sucursal_id in _SUCURSAL_UUIDS:
+        return _SUCURSAL_UUIDS[sucursal_id]
+    try:
+        return str(UUID(str(sucursal_id)))
+    except ValueError:
+        return None
+
+
+def _sucursal_desde_db(valor: Any) -> Optional[str]:
+    if not valor:
+        return None
+    return _SUCURSAL_CODIGOS.get(str(valor), str(valor))
+
+
+def _nombre_sucursal(codigo: Optional[str]) -> str:
+    if not codigo:
+        return "General / Multicanal"
+    return _SUCURSALES_NOMBRES_MAP.get(codigo, "Sucursal Específica")
+
+
+def _obtener_listas_precios(supabase: Optional[Any]) -> List[Dict[str, Any]]:
+    """Listas persistidas en Supabase más las listas semilla que aún no se han persistido."""
+    listas: Dict[str, Dict[str, Any]] = {}
+    if supabase:
+        try:
+            for row in supabase.table("listas_precios").select("*").execute().data or []:
+                codigo = _sucursal_desde_db(row.get("sucursal_id"))
+                listas[str(row["id"])] = {
+                    **row,
+                    "id": str(row["id"]),
+                    "sucursal_id": codigo,
+                    "sucursal_nombre": _nombre_sucursal(codigo),
+                    "moneda": row.get("moneda") or "BOB",
+                    "activo": bool(row.get("activo", True)),
+                }
+        except Exception as e:
+            logger.warning(f"Error consultando listas_precios en Supabase: {e}")
+    for lista in _LOCAL_LISTAS_PRECIOS.values():
+        listas.setdefault(str(lista["id"]), {**lista, "id": str(lista["id"])})
+    return list(listas.values())
+
+
+def _obtener_items_precios(supabase: Optional[Any], lista_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    items: Dict[tuple, Dict[str, Any]] = {}
+    if supabase:
+        try:
+            query = supabase.table("precios_items").select("id, lista_precio_id, variante_id, precio, fecha_inicio, fecha_fin")
+            if lista_id:
+                query = query.eq("lista_precio_id", lista_id)
+            for row in query.execute().data or []:
+                clave = (str(row["lista_precio_id"]), str(row["variante_id"]))
+                items[clave] = {**row, "id": str(row["id"]), "lista_precio_id": clave[0], "variante_id": clave[1]}
+        except Exception as e:
+            logger.warning(f"Error consultando precios_items en Supabase: {e}")
+    for item in _LOCAL_PRECIOS_ITEMS.values():
+        clave = (str(item["lista_precio_id"]), str(item["variante_id"]))
+        if lista_id and clave[0] != lista_id:
+            continue
+        items.setdefault(clave, {**item, "lista_precio_id": clave[0], "variante_id": clave[1]})
+    return list(items.values())
+
+
+def _buscar_producto_por_id(universo: List[ProductoResponse], identificador: str) -> Optional[ProductoResponse]:
+    for producto in universo:
+        if str(producto.id) == identificador or any(str(v.id) == identificador for v in producto.variantes):
+            return producto
+    return None
+
+
+def _es_producto_local(producto: ProductoResponse) -> bool:
+    return str(producto.id) in {str(clave) for clave in _LOCAL_PRODUCTOS}
+
+
+def _lista_precio_response(lista: Dict[str, Any], total_items: int = 0) -> ListaPrecioResponse:
+    return ListaPrecioResponse(
+        id=str(lista["id"]),
+        nombre=lista["nombre"],
+        canal=lista["canal"],
+        tipo_cliente=lista["tipo_cliente"],
+        sucursal_id=lista.get("sucursal_id"),
+        sucursal_nombre=lista.get("sucursal_nombre") or _nombre_sucursal(lista.get("sucursal_id")),
+        moneda=lista.get("moneda") or "BOB",
+        activo=bool(lista.get("activo", True)),
+        total_items=total_items,
+        items=[],
+        created_at=lista.get("created_at"),
+    )
 
 _LOCAL_LISTAS_PRECIOS: Dict[str, Dict[str, Any]] = {
     "11111111-1111-1111-1111-111111111111": {
@@ -1757,69 +1888,24 @@ async def listar_listas_precios(
     """
     RF-04: Lista las listas de precios diferenciadas configuradas en el sistema.
     """
-    supabase = get_supabase_client() or get_supabase_admin_client()
-    if supabase:
-        try:
-            q = supabase.table("listas_precios").select("*")
-            if canal:
-                q = q.eq("canal", canal)
-            if tipo_cliente:
-                q = q.eq("tipo_cliente", tipo_cliente)
-            if sucursal_id:
-                q = q.eq("sucursal_id", str(sucursal_id))
-            if activo is not None:
-                q = q.eq("activo", activo)
-            res = q.order("nombre").execute()
-            if res.data and len(res.data) > 0:
-                result = []
-                for row in res.data:
-                    # Contar items
-                    items_res = supabase.table("precios_items").select("id", count="exact").eq("lista_precio_id", row["id"]).execute()
-                    total_items = items_res.count if hasattr(items_res, "count") and items_res.count is not None else 0
-                    suc_nombre = _SUCURSALES_NOMBRES_MAP.get(str(row.get("sucursal_id")), "Sucursal Específica" if row.get("sucursal_id") else "General / Multicanal")
-                    result.append(ListaPrecioResponse(
-                        id=str(row["id"]),
-                        nombre=row["nombre"],
-                        canal=row["canal"],
-                        tipo_cliente=row["tipo_cliente"],
-                        sucursal_id=str(row["sucursal_id"]) if row.get("sucursal_id") else None,
-                        sucursal_nombre=suc_nombre,
-                        moneda=row.get("moneda", "BOB"),
-                        activo=bool(row.get("activo", True)),
-                        total_items=total_items,
-                        items=[],
-                        created_at=row.get("created_at")
-                    ))
-                return result
-        except Exception as e:
-            logger.warning(f"Error consultando listas_precios en Supabase: {e}")
+    supabase = _get_supabase_client_safe()
+    conteo: Dict[str, int] = {}
+    for item in _obtener_items_precios(supabase):
+        conteo[item["lista_precio_id"]] = conteo.get(item["lista_precio_id"], 0) + 1
 
-    # Fallback local
-    resultado_local = []
-    for lp in _LOCAL_LISTAS_PRECIOS.values():
-        if canal and lp["canal"] != canal:
+    resultado = []
+    for lista in _obtener_listas_precios(supabase):
+        if canal and lista["canal"] != canal:
             continue
-        if tipo_cliente and lp["tipo_cliente"] != tipo_cliente:
+        if tipo_cliente and lista["tipo_cliente"] != tipo_cliente:
             continue
-        if sucursal_id and lp.get("sucursal_id") != sucursal_id:
+        if sucursal_id and lista.get("sucursal_id") != sucursal_id:
             continue
-        if activo is not None and lp.get("activo") != activo:
+        if activo is not None and bool(lista.get("activo", True)) != activo:
             continue
-        items_count = sum(1 for it in _LOCAL_PRECIOS_ITEMS.values() if it["lista_precio_id"] == lp["id"])
-        resultado_local.append(ListaPrecioResponse(
-            id=str(lp["id"]),
-            nombre=lp["nombre"],
-            canal=lp["canal"],
-            tipo_cliente=lp["tipo_cliente"],
-            sucursal_id=lp.get("sucursal_id"),
-            sucursal_nombre=lp.get("sucursal_nombre"),
-            moneda=lp["moneda"],
-            activo=lp["activo"],
-            total_items=items_count,
-            items=[],
-            created_at=lp.get("created_at")
-        ))
-    return resultado_local
+        resultado.append(_lista_precio_response(lista, conteo.get(lista["id"], 0)))
+    resultado.sort(key=lambda lista: lista.nombre)
+    return resultado
 
 @router.post("/listas-precios", response_model=ListaPrecioResponse, status_code=status.HTTP_201_CREATED)
 @require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
@@ -1831,25 +1917,17 @@ async def crear_lista_precio(
     RF-04: Crea una nueva lista de precios diferenciada (Administrador / Gerente Comercial).
     """
     new_id = str(uuid4())
-    suc_nombre = payload.sucursal_nombre or _SUCURSALES_NOMBRES_MAP.get(payload.sucursal_id or "", "General / Multicanal")
+    suc_nombre = payload.sucursal_nombre or _nombre_sucursal(payload.sucursal_id)
     
-    supabase = get_supabase_client() or get_supabase_admin_client()
+    supabase = _get_supabase_client_safe()
     if supabase:
         try:
-            # Si sucursal_id no es un UUID válido, o si es string simulado
-            clean_sucursal_id = None
-            if payload.sucursal_id:
-                try:
-                    clean_sucursal_id = str(UUID(payload.sucursal_id))
-                except Exception:
-                    clean_sucursal_id = None
-
             insert_data = {
                 "id": new_id,
                 "nombre": payload.nombre,
                 "canal": payload.canal,
                 "tipo_cliente": payload.tipo_cliente,
-                "sucursal_id": clean_sucursal_id,
+                "sucursal_id": _sucursal_a_db(payload.sucursal_id),
                 "moneda": payload.moneda,
                 "activo": payload.activo,
             }
@@ -1909,31 +1987,22 @@ async def actualizar_lista_precio(
     """
     RF-04: Actualiza parámetros de una lista de precios existente.
     """
-    supabase = get_supabase_client() or get_supabase_admin_client()
+    supabase = _get_supabase_client_safe()
     if supabase:
         try:
             update_data = {}
             if payload.nombre is not None: update_data["nombre"] = payload.nombre
             if payload.canal is not None: update_data["canal"] = payload.canal
             if payload.tipo_cliente is not None: update_data["tipo_cliente"] = payload.tipo_cliente
+            if payload.sucursal_id is not None: update_data["sucursal_id"] = _sucursal_a_db(payload.sucursal_id)
             if payload.moneda is not None: update_data["moneda"] = payload.moneda
             if payload.activo is not None: update_data["activo"] = payload.activo
             if update_data:
                 res = supabase.table("listas_precios").update(update_data).eq("id", lista_id).execute()
                 if res.data and len(res.data) > 0:
                     row = res.data[0]
-                    return ListaPrecioResponse(
-                        id=str(row["id"]),
-                        nombre=row["nombre"],
-                        canal=row["canal"],
-                        tipo_cliente=row["tipo_cliente"],
-                        sucursal_id=str(row["sucursal_id"]) if row.get("sucursal_id") else None,
-                        sucursal_nombre=_SUCURSALES_NOMBRES_MAP.get(str(row.get("sucursal_id")), "General"),
-                        moneda=row.get("moneda", "BOB"),
-                        activo=row.get("activo", True),
-                        total_items=0,
-                        items=[]
-                    )
+                    codigo = _sucursal_desde_db(row.get("sucursal_id"))
+                    return _lista_precio_response({**row, "sucursal_id": codigo, "sucursal_nombre": _nombre_sucursal(codigo)})
         except Exception as e:
             logger.warning(f"Error actualizando lista de precios en Supabase: {e}")
 
@@ -1959,7 +2028,7 @@ async def eliminar_lista_precio(
     """
     RF-04: Elimina una lista de precios.
     """
-    supabase = get_supabase_client() or get_supabase_admin_client()
+    supabase = _get_supabase_client_safe()
     if supabase:
         try:
             supabase.table("listas_precios").delete().eq("id", lista_id).execute()
@@ -1980,51 +2049,53 @@ async def listar_items_lista_precio(lista_id: str):
     """
     RF-04: Lista las tarifas específicas por variante asignadas a esta lista de precios.
     """
-    supabase = get_supabase_client() or get_supabase_admin_client()
-    if supabase:
-        try:
-            res = (
-                supabase
-                .table("precios_items")
-                .select("id, lista_precio_id, variante_id, precio, fecha_inicio, fecha_fin, variantes(sku, nombre_variante, productos(nombre))")
-                .eq("lista_precio_id", lista_id)
-                .execute()
-            )
-            if res.data:
-                items = []
-                for r in res.data:
-                    v_data = r.get("variantes") or {}
-                    p_data = v_data.get("productos") or {}
-                    nombre_disp = p_data.get("nombre") or v_data.get("nombre_variante") or "Item"
-                    items.append(PrecioItemResponse(
-                        id=str(r["id"]),
-                        lista_precio_id=str(r["lista_precio_id"]),
-                        variante_id=str(r["variante_id"]),
-                        sku=v_data.get("sku"),
-                        nombre=nombre_disp,
-                        precio=Decimal(str(r["precio"])),
-                        fecha_inicio=r.get("fecha_inicio"),
-                        fecha_fin=r.get("fecha_fin")
-                    ))
-                return items
-        except Exception as e:
-            logger.warning(f"Error listando items de lista_precio en Supabase: {e}")
+    supabase = _get_supabase_client_safe()
+    return _items_precio_response(_obtener_items_precios(supabase, lista_id), _fetch_all_products(supabase))
 
-    # Fallback local
-    items = []
-    for it in _LOCAL_PRECIOS_ITEMS.values():
-        if it["lista_precio_id"] == lista_id:
-            items.append(PrecioItemResponse(
-                id=it["id"],
-                lista_precio_id=it["lista_precio_id"],
-                variante_id=it["variante_id"],
-                sku=it.get("sku"),
-                nombre=it.get("nombre"),
-                precio=it["precio"],
-                fecha_inicio=it.get("fecha_inicio"),
-                fecha_fin=it.get("fecha_fin")
-            ))
-    return items
+
+@router.get("/productos/{product_id}/precios", response_model=List[PrecioItemResponse])
+async def listar_precios_producto(product_id: str):
+    """RF-04: Tarifas diferenciadas de un producto (o sus variantes) en todas las listas."""
+    supabase = _get_supabase_client_safe()
+    universo = _fetch_all_products(supabase)
+    producto = _buscar_producto_por_id(universo, product_id)
+    claves = {product_id}
+    if producto:
+        claves |= {str(producto.id)} | {str(v.id) for v in producto.variantes}
+    items = [item for item in _obtener_items_precios(supabase) if item["variante_id"] in claves]
+    return _items_precio_response(items, universo)
+
+
+def _items_precio_response(items: List[Dict[str, Any]], universo: List[ProductoResponse]) -> List[PrecioItemResponse]:
+    respuesta = []
+    for item in items:
+        producto = _buscar_producto_por_id(universo, item["variante_id"])
+        respuesta.append(PrecioItemResponse(
+            id=str(item["id"]),
+            lista_precio_id=item["lista_precio_id"],
+            variante_id=item["variante_id"],
+            sku=producto.sku if producto else item.get("sku"),
+            nombre=producto.nombre if producto else item.get("nombre"),
+            precio=Decimal(str(item["precio"])),
+            fecha_inicio=item.get("fecha_inicio"),
+            fecha_fin=item.get("fecha_fin"),
+        ))
+    return respuesta
+
+
+def _asegurar_lista_persistida(supabase: Any, lista_id: str) -> None:
+    lista = _LOCAL_LISTAS_PRECIOS.get(lista_id)
+    if not lista:
+        return
+    supabase.table("listas_precios").upsert({
+        "id": lista_id,
+        "nombre": lista["nombre"],
+        "canal": lista["canal"],
+        "tipo_cliente": lista["tipo_cliente"],
+        "sucursal_id": _sucursal_a_db(lista.get("sucursal_id")),
+        "moneda": lista.get("moneda", "BOB"),
+        "activo": lista.get("activo", True),
+    }, on_conflict="id").execute()
 
 @router.post("/listas-precios/{lista_id}/items", response_model=PrecioItemResponse, status_code=status.HTTP_201_CREATED)
 @require_jwt_claims("sub", allowed_roles={"administrador", "gerente_comercial"})
@@ -2037,26 +2108,24 @@ async def asignar_precio_item(
     RF-04: Asigna o actualiza una tarifa específica para una variante en la lista de precios.
     """
     new_id = str(uuid4())
-    supabase = get_supabase_client() or get_supabase_admin_client()
+    supabase = _get_supabase_client_safe()
+    producto = _buscar_producto_por_id(_fetch_all_products(supabase), payload.variante_id)
+    sku_ref = producto.sku if producto else "SKU-ITEM"
+    nombre_ref = producto.nombre if producto else "Producto Variante"
+    # precios_items referencia variantes: un ID de producto se guarda sobre su variante principal.
+    variante_id = payload.variante_id
+    if producto and str(producto.id) == payload.variante_id and producto.variantes:
+        variante_id = str(producto.variantes[0].id)
+    fecha_inicio = payload.fecha_inicio or datetime.now(timezone.utc)
 
-    # Obtener SKU / Nombre de referencia
-    sku_ref = "SKU-ITEM"
-    nombre_ref = "Producto Variante"
-    client = _get_supabase_client_safe()
-    universo = _fetch_all_products(client)
-    for p in universo:
-        if str(p.id) == payload.variante_id or any(str(v.id) == payload.variante_id for v in p.variantes):
-            sku_ref = p.sku
-            nombre_ref = p.nombre
-            break
-
-    if supabase:
+    if supabase and producto and not _es_producto_local(producto):
         try:
+            _asegurar_lista_persistida(supabase, lista_id)
             upsert_data = {
                 "lista_precio_id": lista_id,
-                "variante_id": payload.variante_id,
+                "variante_id": variante_id,
                 "precio": float(payload.precio),
-                "fecha_inicio": payload.fecha_inicio.isoformat() if payload.fecha_inicio else datetime.now(timezone.utc).isoformat(),
+                "fecha_inicio": fecha_inicio.isoformat(),
                 "fecha_fin": payload.fecha_fin.isoformat() if payload.fecha_fin else None
             }
             res = supabase.table("precios_items").upsert(upsert_data, on_conflict="lista_precio_id,variante_id").execute()
@@ -2076,22 +2145,22 @@ async def asignar_precio_item(
             logger.warning(f"Error upsert precios_items en Supabase: {e}")
 
     # Local fallback
-    item_key = f"{lista_id}_{payload.variante_id}"
+    item_key = f"{lista_id}_{variante_id}"
     _LOCAL_PRECIOS_ITEMS[item_key] = {
         "id": new_id,
         "lista_precio_id": lista_id,
-        "variante_id": payload.variante_id,
+        "variante_id": variante_id,
         "sku": sku_ref,
         "nombre": nombre_ref,
         "precio": payload.precio,
-        "fecha_inicio": payload.fecha_inicio or datetime.now(timezone.utc),
+        "fecha_inicio": fecha_inicio,
         "fecha_fin": payload.fecha_fin
     }
 
     return PrecioItemResponse(
         id=new_id,
         lista_precio_id=lista_id,
-        variante_id=payload.variante_id,
+        variante_id=variante_id,
         sku=sku_ref,
         nombre=nombre_ref,
         precio=payload.precio,
@@ -2106,7 +2175,7 @@ async def eliminar_precio_item(
     item_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    supabase = get_supabase_client() or get_supabase_admin_client()
+    supabase = _get_supabase_client_safe()
     if supabase:
         try:
             supabase.table("precios_items").delete().eq("id", item_id).execute()
@@ -2145,133 +2214,115 @@ async def resolver_precio(
     3. Si no, busca lista general del canal (sin sucursal asociada).
     4. Fallback: Precio base de la variante o producto del catálogo.
     """
-    ahora = datetime.now(timezone.utc)
     variante_str = str(variante_id)
+    return _resolver_precios([variante_str], canal, tipo_cliente, sucursal_id)[variante_str]
 
-    # 1. Obtener todas las listas activas candidatas ordenadas por jerarquía
-    listas_candidatas: List[Dict[str, Any]] = []
 
-    supabase = get_supabase_client() or get_supabase_admin_client()
-    if supabase:
-        try:
-            res = supabase.table("listas_precios").select("*").eq("activo", True).execute()
-            if res.data:
-                listas_candidatas = res.data
-        except Exception as e:
-            logger.warning(f"Error consultando listas en resolver_precio: {e}")
+@router.get("/precios/resolver-lote", response_model=Dict[str, PrecioResolucionResponse])
+async def resolver_precios_lote(
+    variante_ids: str = Query(..., description="IDs de producto o variante separados por coma"),
+    canal: str = Query(..., pattern="^(web|pos|b2b)$"),
+    tipo_cliente: str = Query("retail", pattern="^(retail|corporativo_b2b)$"),
+    sucursal_id: Optional[str] = None,
+):
+    """RF-04: Resuelve en una sola consulta los precios de varios productos para un canal/cliente/sucursal."""
+    identificadores = list(dict.fromkeys(i.strip() for i in variante_ids.split(",") if i.strip()))
+    if not identificadores or len(identificadores) > 200:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Envía entre 1 y 200 identificadores.")
+    return _resolver_precios(identificadores, canal, tipo_cliente, sucursal_id)
 
-    if not listas_candidatas:
-        listas_candidatas = list(_LOCAL_LISTAS_PRECIOS.values())
 
-    # Ordenar por especificidad / jerarquía según US-04:
-    # 1º: Reglas corporativo B2B
-    # 2º: Reglas con sucursal específica coincidente
-    # 3º: Reglas de canal general
-    def calcular_peso_prioridad(lp: Dict[str, Any]) -> int:
+def _fecha_tarifa(valor: Any) -> Optional[datetime]:
+    if not valor:
+        return None
+    if isinstance(valor, datetime):
+        fecha = valor
+    else:
+        # Python 3.10 solo acepta fracciones de 3 o 6 dígitos; Supabase puede devolver otras longitudes.
+        texto = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), str(valor).replace("Z", "+00:00"), count=1)
+        fecha = datetime.fromisoformat(texto)
+    return fecha if fecha.tzinfo else fecha.replace(tzinfo=timezone.utc)
+
+
+def _resolver_precios(
+    identificadores: List[str],
+    canal: str,
+    tipo_cliente: str,
+    sucursal_id: Optional[str],
+) -> Dict[str, PrecioResolucionResponse]:
+    """
+    Jerarquía US-04: Cliente B2B > Sucursal específica > Canal general > Precio base del catálogo.
+    Solo participan listas activas del mismo canal, tipo de cliente compatible y sucursal coincidente o general.
+    """
+    ahora = datetime.now(timezone.utc)
+    supabase = _get_supabase_client_safe()
+    universo = _fetch_all_products(supabase)
+    tipos_compatibles = {tipo_cliente} | ({"retail"} if tipo_cliente == "corporativo_b2b" else set())
+
+    def aplicable(lista: Dict[str, Any]) -> bool:
+        return (
+            bool(lista.get("activo", True))
+            and lista.get("canal") == canal
+            and lista.get("tipo_cliente", "retail") in tipos_compatibles
+            and (not lista.get("sucursal_id") or lista.get("sucursal_id") == sucursal_id)
+        )
+
+    def prioridad(lista: Dict[str, Any]) -> int:
         peso = 0
-        lp_canal = lp.get("canal")
-        lp_tipo = lp.get("tipo_cliente")
-        lp_sucursal = lp.get("sucursal_id")
-
-        if tipo_cliente == "corporativo_b2b" and lp_tipo == "corporativo_b2b":
+        if tipo_cliente == "corporativo_b2b" and lista.get("tipo_cliente") == "corporativo_b2b":
             peso += 100
-        if sucursal_id and lp_sucursal and str(lp_sucursal) == str(sucursal_id):
+        if sucursal_id and lista.get("sucursal_id") == sucursal_id:
             peso += 50
-        if lp_canal == canal:
-            peso += 20
-        if not lp_sucursal: # Canal general
-            peso += 10
         return peso
 
-    listas_ordenadas = sorted(
-        [l for l in listas_candidatas if l.get("activo", True)],
-        key=calcular_peso_prioridad,
-        reverse=True
-    )
+    listas = sorted((lista for lista in _obtener_listas_precios(supabase) if aplicable(lista)), key=prioridad, reverse=True)
+    indice = {(item["lista_precio_id"], item["variante_id"]): item for item in _obtener_items_precios(supabase)}
 
-    # Buscar tarifa para la variante en las listas ordenadas por prioridad
-    for lista in listas_ordenadas:
-        l_id = str(lista["id"])
+    resultado: Dict[str, PrecioResolucionResponse] = {}
+    for identificador in identificadores:
+        producto = _buscar_producto_por_id(universo, identificador)
+        claves = [identificador]
+        if producto:
+            claves += [str(producto.id)] + [str(v.id) for v in producto.variantes]
 
-        # Intentar en Supabase
-        if supabase:
-            try:
-                precios_res = (
-                    supabase
-                    .table("precios_items")
-                    .select("*")
-                    .eq("lista_precio_id", l_id)
-                    .eq("variante_id", variante_str)
-                    .execute()
-                )
-                if precios_res.data:
-                    for item in precios_res.data:
-                        f_inicio = datetime.fromisoformat(item["fecha_inicio"].replace("Z", "+00:00")) if item.get("fecha_inicio") else ahora
-                        f_fin = datetime.fromisoformat(item["fecha_fin"].replace("Z", "+00:00")) if item.get("fecha_fin") else None
-                        if f_inicio <= ahora and (f_fin is None or ahora <= f_fin):
-                            return PrecioResolucionResponse(
-                                lista_precio_id=UUID(l_id) if len(l_id) == 36 else uuid4(),
-                                lista_nombre=lista["nombre"],
-                                variante_id=UUID(variante_str) if len(variante_str) == 36 else uuid4(),
-                                precio=Decimal(str(item["precio"])),
-                                moneda=lista.get("moneda", "BOB"),
-                                canal=lista["canal"],
-                                tipo_cliente=lista["tipo_cliente"],
-                                sucursal_id=UUID(str(lista["sucursal_id"])) if lista.get("sucursal_id") and len(str(lista["sucursal_id"])) == 36 else None,
-                                fecha_inicio=item.get("fecha_inicio", ahora.isoformat()),
-                                fecha_fin=item.get("fecha_fin")
-                            )
-            except Exception:
-                pass
+        resolucion: Optional[PrecioResolucionResponse] = None
+        for lista in listas:
+            for clave in claves:
+                item = indice.get((lista["id"], clave))
+                if not item:
+                    continue
+                inicio = _fecha_tarifa(item.get("fecha_inicio")) or ahora
+                fin = _fecha_tarifa(item.get("fecha_fin"))
+                if inicio <= ahora and (fin is None or ahora <= fin):
+                    resolucion = PrecioResolucionResponse(
+                        lista_precio_id=lista["id"],
+                        lista_nombre=lista["nombre"],
+                        variante_id=identificador,
+                        precio=Decimal(str(item["precio"])),
+                        moneda=lista.get("moneda") or "BOB",
+                        canal=lista["canal"],
+                        tipo_cliente=lista["tipo_cliente"],
+                        sucursal_id=lista.get("sucursal_id"),
+                        fecha_inicio=inicio.isoformat(),
+                        fecha_fin=fin.isoformat() if fin else None,
+                    )
+                    break
+            if resolucion:
+                break
 
-        # Intentar en almacenamiento local
-        for it in _LOCAL_PRECIOS_ITEMS.values():
-            if str(it["lista_precio_id"]) == l_id and str(it["variante_id"]) == variante_str:
-                return PrecioResolucionResponse(
-                    lista_precio_id=UUID(l_id) if len(l_id) == 36 else uuid4(),
-                    lista_nombre=lista["nombre"],
-                    variante_id=UUID(variante_str) if len(variante_str) == 36 else uuid4(),
-                    precio=Decimal(str(it["precio"])),
-                    moneda=lista.get("moneda", "BOB"),
-                    canal=lista["canal"],
-                    tipo_cliente=lista["tipo_cliente"],
-                    sucursal_id=None,
-                    fecha_inicio=ahora.isoformat(),
-                    fecha_fin=None
-                )
-
-    # 4. Fallback a precio base del catálogo
-    client = _get_supabase_client_safe()
-    universo = _fetch_all_products(client)
-    for p in universo:
-        if str(p.id) == variante_str or any(str(v.id) == variante_str for v in p.variantes):
-            precio_base = Decimal(str(p.precio or "100.00"))
-            # Si es corporativo_b2b y no hay lista explícita, aplicar 10% de tarifa mayorista estándar
+        if not resolucion:
+            precio_base = Decimal(str(producto.precio)) if producto else Decimal("150.00")
+            # Sin lista explícita, el cliente corporativo recibe la tarifa mayorista estándar (-10%).
             if tipo_cliente == "corporativo_b2b":
                 precio_base = (precio_base * Decimal("0.90")).quantize(Decimal("0.01"))
-            return PrecioResolucionResponse(
-                lista_precio_id=uuid4(),
+            resolucion = PrecioResolucionResponse(
                 lista_nombre=f"Tarifa Base Catálogo ({canal.upper()} - {tipo_cliente})",
-                variante_id=UUID(variante_str) if len(variante_str) == 36 else uuid4(),
+                variante_id=identificador,
                 precio=precio_base,
                 moneda="BOB",
                 canal=canal,
                 tipo_cliente=tipo_cliente,
-                sucursal_id=None,
                 fecha_inicio=ahora.isoformat(),
-                fecha_fin=None
             )
-
-    # Fallback genérico final
-    return PrecioResolucionResponse(
-        lista_precio_id=uuid4(),
-        lista_nombre=f"Lista Estándar ({canal.upper()} - {tipo_cliente})",
-        variante_id=UUID(variante_str) if len(variante_str) == 36 else uuid4(),
-        precio=Decimal("150.00"),
-        moneda="BOB",
-        canal=canal,
-        tipo_cliente=tipo_cliente,
-        sucursal_id=None,
-        fecha_inicio=ahora.isoformat(),
-        fecha_fin=None
-    )
+        resultado[identificador] = resolucion
+    return resultado

@@ -21,14 +21,6 @@ app = FastAPI(
 )
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.add_middleware(
     RBACAuthorizationMiddleware,
     rules=[
         RBACRule("/api/v1/pos", frozenset({"cajero", "administrador"})),
@@ -44,6 +36,15 @@ app.add_middleware(
             frozenset({"POST", "PATCH", "DELETE"}),
         ),
     ],
+)
+
+# Registrado al final para ser la capa más externa: los 401/403 del RBAC también llevan cabeceras CORS.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.add_exception_handler(MaxiConectaException, maxiconecta_exception_handler)
@@ -99,10 +100,11 @@ async def forward_request(target_base_url: str, request: Request, custom_path: O
     }
     if request.headers.get("content-type", "").startswith("application/json"):
         raw_body = await request.body()
-        try:
-            request_kwargs["json"] = json.loads(raw_body.decode("utf-8"))
-        except UnicodeDecodeError:
-            request_kwargs["json"] = json.loads(raw_body.decode("cp1252"))
+        if raw_body.strip():
+            try:
+                request_kwargs["json"] = json.loads(raw_body.decode("utf-8"))
+            except UnicodeDecodeError:
+                request_kwargs["json"] = json.loads(raw_body.decode("cp1252"))
     else:
         request_kwargs["content"] = await request.body()
 

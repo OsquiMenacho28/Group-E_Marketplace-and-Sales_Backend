@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from backend.shared.database import get_supabase_admin_client
+from backend.shared.erp_clients.inventarios import inventarios_client
 from backend.shared.erp_clients.pagos import pagos_client
 
 logger = logging.getLogger("maxiconecta.facturacion")
@@ -333,6 +334,12 @@ async def emitir_factura(payload: EmitirFacturaRequest):
     descuento_val = float(payload.descuento) if payload.descuento else 0.0
     total_pagar = max(0.0, round(subtotal_calculado - descuento_val, 2))
     monto_iva = round(total_pagar * 0.13, 2)  # 13% IVA oficial de Bolivia
+
+    # Las órdenes web ya descontaron stock al confirmar su reserva; solo la venta POS directa descuenta aquí.
+    if not payload.orden_id:
+        consumo = await inventarios_client.descuento_directo(items_procesados, orden_id=f"POS-{uuid.uuid4().hex[:8]}")
+        if consumo.get("status") == "RECHAZADA":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=consumo.get("mensaje", "Stock insuficiente."))
 
     # 2. Correlativo, CUF y CUFD oficiales
     _ULTIMO_CORRELATIVO += 1

@@ -23,6 +23,7 @@ from backend.shared.redis_client import (
     liberar_reserva_stock, confirmar_reserva_stock
 )
 from backend.shared.erp_clients.inventarios import inventarios_client
+from backend.shared import stock_ledger
 
 from backend.shared.database import get_supabase_client
 
@@ -32,6 +33,16 @@ _CUPONES_VALIDOS = {
     "MAXI10": Decimal("10.0"),  # 10%
     "BIENVENIDO": Decimal("20.0") # 20 BOB
 }
+
+
+async def _validar_stock_carrito(items: List[dict], sku: str) -> None:
+    total = sum(int(item["cantidad"]) for item in items if item.get("sku") == sku)
+    disponible = await stock_ledger.available_stock(sku, register_missing=False)
+    if disponible is not None and total > disponible:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Stock insuficiente para {sku}. Disponibles: {disponible}."
+        )
 
 @router.get("/{identificador}", response_model=CarritoResponse)
 async def ver_carrito(identificador: str):
@@ -82,6 +93,7 @@ async def agregar_item_carrito(identificador: str, payload: ItemCarritoAdd):
         })
 
     raw["items"] = items
+    await _validar_stock_carrito(items, payload.sku)
     await save_cart_to_cache(identificador, raw)
     return await ver_carrito(identificador)
 
@@ -101,6 +113,7 @@ async def actualizar_cantidad_item(identificador: str, variante_id: str, payload
     if not item:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El ítem no existe en el carrito")
     item["cantidad"] = payload.cantidad
+    await _validar_stock_carrito(raw.get("items", []), item["sku"])
     await save_cart_to_cache(identificador, raw)
     return await ver_carrito(identificador)
 

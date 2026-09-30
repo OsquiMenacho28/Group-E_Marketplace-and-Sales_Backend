@@ -72,6 +72,14 @@ async def procesar_venta_pos(
     orden_id = uuid.uuid4()
     codigo_orden = f"POS-{uuid.uuid4().hex[:6].upper()}"
 
+    # Descuento en inventario RIO-INV-03 antes de cobrar, para no vender sin stock
+    consumo = await inventarios_client.descuento_directo(
+        [{"sku": i.sku, "cantidad": i.cantidad} for i in payload.items],
+        orden_id=str(orden_id),
+    )
+    if consumo.get("status") == "RECHAZADA":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=consumo.get("mensaje", "Stock insuficiente."))
+
     # Acumular en caja
     if payload.metodo_pago == "efectivo":
         caja.total_efectivo += total
@@ -87,9 +95,6 @@ async def procesar_venta_pos(
         "razon_social": payload.cliente_razon_social,
         "monto_total": float(total)
     })
-
-    # Descuento en inventario local RIO-INV-03
-    await inventarios_client.descuento_definitivo(reserva_id="pos-direct", orden_id=str(orden_id))
 
     ticket = f"""
     ========================================

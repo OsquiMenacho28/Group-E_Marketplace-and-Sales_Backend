@@ -6,12 +6,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 try:
     from app.schemas import (
         ClienteRegistro, ClienteLogin, PerfilResponse, TokenResponse, RefreshTokenRequest,
-        DireccionCreate, DireccionResponse, NotificacionesConfig
+        DireccionCreate, DireccionUpdate, DireccionResponse, NotificacionesConfig
     )
 except (ModuleNotFoundError, ImportError):
     from backend.services.clientes.app.schemas import (
         ClienteRegistro, ClienteLogin, PerfilResponse, TokenResponse, RefreshTokenRequest,
-        DireccionCreate, DireccionResponse, NotificacionesConfig
+        DireccionCreate, DireccionUpdate, DireccionResponse, NotificacionesConfig
     )
 from backend.shared.security import (
     create_access_token, create_refresh_token, decode_access_token,
@@ -364,37 +364,193 @@ async def obtener_perfil(cliente_id: uuid.UUID):
         puntos_saldo=120
     )
 
-@router.post("/{cliente_id}/direcciones", response_model=DireccionResponse, status_code=status.HTTP_201_CREATED)
-async def agregar_direccion(cliente_id: uuid.UUID, payload: DireccionCreate):
-    """RF-23: Agregar dirección de entrega a libreta."""
-    dir_id = uuid.uuid4()
-    direccion = DireccionResponse(
-        id=dir_id,
-        cliente_id=cliente_id,
-        direccion=payload.direccion,
-        referencia=payload.referencia,
-        ciudad=payload.ciudad,
-        es_predeterminada=payload.es_predeterminada
+def _autorizar_cliente_direcciones(cliente_id: uuid.UUID, current_user: Dict[str, Any]) -> str:
+    usuario_id = str(current_user.get("user_id") or current_user.get("id") or "")
+    if usuario_id != str(cliente_id) and current_user.get("role") not in {"administrador", "gerente_comercial"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes consultar ni modificar direcciones de otro cliente.")
+    return str(cliente_id)
+
+
+def _direccion_desde_fila(row: Dict[str, Any]) -> DireccionResponse:
+    return DireccionResponse(
+        id=row["id"],
+        cliente_id=row["cliente_id"],
+        direccion=row["direccion"],
+        referencia=row.get("referencia"),
+        ciudad=row["ciudad"],
+        latitud=row.get("latitud"),
+        longitud=row.get("longitud"),
+        es_predeterminada=bool(row.get("es_predeterminada", False)),
     )
-    cid_str = str(cliente_id)
-    if cid_str not in _DIRECCIONES_DB:
-        _DIRECCIONES_DB[cid_str] = []
-    _DIRECCIONES_DB[cid_str].append(direccion)
-    return direccion
+
+
+async def _guardar_direccion_memoria(cliente_id: str, direccion: DireccionResponse) -> None:
+    direcciones = _DIRECCIONES_DB.setdefault(cliente_id, [])
+    if direccion.es_predeterminada:
+        for anterior in direcciones:
+            anterior.es_predeterminada = False
+    direcciones.append(direccion)
+
+
+async def _marcar_predeterminada(cliente_id: str, direccion_id: str) -> None:
+    supabase = get_supabase_admin_client()
+    if supabase:
+        supabase.table("direcciones_cliente").update({"es_predeterminada": False}).eq("cliente_id", cliente_id).execute()
+        result = supabase.table("direcciones_cliente").update({"es_predeterminada": True}).eq("cliente_id", cliente_id).eq("id", direccion_id).execute()
+        if not result.data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dirección no encontrada.")
+    for direccion in _DIRECCIONES_DB.get(cliente_id, []):
+        direccion.es_predeterminada = str(direccion.id) == direccion_id
+
+
+@router.post("/{cliente_id}/direcciones", response_model=DireccionResponse, status_code=status.HTTP_201_CREATED)
+async def agregar_direccion(
+    cliente_id: uuid.UUID,
+    payload: DireccionCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """RF-23: Persiste dirección con referencias, coordenadas y estado predeterminado."""
+    cid = _autorizar_cliente_direcciones(cliente_id, current_user)
+    supabase = get_supabase_admin_client()
+    direcciones_actuales = await listar_direcciones(cliente_id, current_user)
+    es_default = payload.es_predeterminada or not direcciones_actuales
+    direccion_id = uuid.uuid4()
+    row = {
+        "id": str(direccion_id),
+        "cliente_id": cid,
+        "direccion": payload.direccion.strip(),
+        "referencia": payload.referencia.strip() if payload.referencia else None,
+        "ciudad": payload.ciudad.strip(),
+        "latitud": payload.latitud,
+        "longitud": payload.longitud,
+        "es_predeterminada": es_default,
+    }
+    if supabase:
+        try:
+            if es_default:
+                supabase.table("direcciones_cliente").update({"es_predeterminada": False}).eq("cliente_id", cid).execute()
+            result = supabase.table("direcciones_cliente").insert(row).execute()
+            if result.data:
+                saved = _direccion_desde_fila(result.data[0])
+                await _guardar_direccion_memoria(cid, saved)
+                return saved
+        except Exception as exc:
+            logger.exception("Error persistiendo dirección de cliente en Supabase")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo guardar la dirección.") from exc
+
+    saved = _direccion_desde_fila(row)
+    await _guardar_direccion_memoria(cid, saved)
+    return saved
+
 
 @router.get("/{cliente_id}/direcciones", response_model=List[DireccionResponse])
-async def listar_direcciones(cliente_id: uuid.UUID):
-    """RF-23: Listar direcciones de entrega del cliente."""
-    return _DIRECCIONES_DB.get(str(cliente_id), [
-        DireccionResponse(
-            id=uuid.uuid4(),
-            cliente_id=cliente_id,
-            direccion="Av. 6 de Agosto #2450, Edificio Los Andes",
-            referencia="Puerta de vidrio, tocar timbre 4B",
-            ciudad="La Paz",
-            es_predeterminada=True
-        )
-    ])
+async def listar_direcciones(
+    cliente_id: uuid.UUID,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """RF-23: Lista exclusivamente las direcciones del propietario autenticado."""
+    cid = _autorizar_cliente_direcciones(cliente_id, current_user)
+    supabase = get_supabase_admin_client()
+    if supabase:
+        try:
+            result = supabase.table("direcciones_cliente").select("*").eq("cliente_id", cid).order("es_predeterminada", desc=True).order("created_at").execute()
+            return [_direccion_desde_fila(row) for row in (result.data or [])]
+        except Exception as exc:
+            logger.exception("Error leyendo direcciones de cliente en Supabase")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudieron cargar las direcciones.") from exc
+    return sorted(_DIRECCIONES_DB.get(cid, []), key=lambda item: not item.es_predeterminada)
+
+
+@router.patch("/{cliente_id}/direcciones/{direccion_id}", response_model=DireccionResponse)
+@router.put("/{cliente_id}/direcciones/{direccion_id}", response_model=DireccionResponse)
+async def actualizar_direccion(
+    cliente_id: uuid.UUID,
+    direccion_id: uuid.UUID,
+    payload: DireccionUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    cid = _autorizar_cliente_direcciones(cliente_id, current_user)
+    supabase = get_supabase_admin_client()
+    direccion_actual: Optional[DireccionResponse] = None
+    if supabase:
+        result = supabase.table("direcciones_cliente").select("*").eq("cliente_id", cid).eq("id", str(direccion_id)).limit(1).execute()
+        if result.data:
+            direccion_actual = _direccion_desde_fila(result.data[0])
+    else:
+        direccion_actual = next((item for item in _DIRECCIONES_DB.get(cid, []) if item.id == direccion_id), None)
+    if not direccion_actual:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dirección no encontrada.")
+
+    cambios = payload.model_dump(exclude_unset=True)
+    nueva_latitud = cambios.get("latitud", direccion_actual.latitud)
+    nueva_longitud = cambios.get("longitud", direccion_actual.longitud)
+    if (nueva_latitud is None) != (nueva_longitud is None):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Latitud y longitud deben proporcionarse juntas.")
+    campos = {key: value for key, value in cambios.items() if key != "es_predeterminada"}
+    if "direccion" in campos and campos["direccion"] is not None:
+        campos["direccion"] = campos["direccion"].strip()
+    if "ciudad" in campos and campos["ciudad"] is not None:
+        campos["ciudad"] = campos["ciudad"].strip()
+    if "referencia" in campos and campos["referencia"] is not None:
+        campos["referencia"] = campos["referencia"].strip() or None
+
+    nuevo_default = cambios.get("es_predeterminada", direccion_actual.es_predeterminada)
+    if direccion_actual.es_predeterminada and nuevo_default is False:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Asigna otra dirección como predeterminada antes de quitar esta.")
+    if supabase:
+        if nuevo_default and not direccion_actual.es_predeterminada:
+            supabase.table("direcciones_cliente").update({"es_predeterminada": False}).eq("cliente_id", cid).execute()
+        campos["es_predeterminada"] = nuevo_default
+        try:
+            result = supabase.table("direcciones_cliente").update(campos).eq("cliente_id", cid).eq("id", str(direccion_id)).execute()
+            if not result.data:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dirección no encontrada.")
+            saved = _direccion_desde_fila(result.data[0])
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Error actualizando dirección en Supabase")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo actualizar la dirección.") from exc
+    else:
+        for item in _DIRECCIONES_DB.get(cid, []):
+            if nuevo_default:
+                item.es_predeterminada = item.id == direccion_id
+        updated = direccion_actual.model_copy(update={**campos, "es_predeterminada": nuevo_default})
+        direccion_list = _DIRECCIONES_DB.get(cid, [])
+        _DIRECCIONES_DB[cid] = [updated if item.id == direccion_id else item for item in direccion_list]
+        saved = updated
+    return saved
+
+
+@router.delete("/{cliente_id}/direcciones/{direccion_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def eliminar_direccion(
+    cliente_id: uuid.UUID,
+    direccion_id: uuid.UUID,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    cid = _autorizar_cliente_direcciones(cliente_id, current_user)
+    supabase = get_supabase_admin_client()
+    if supabase:
+        result = supabase.table("direcciones_cliente").select("*").eq("cliente_id", cid).eq("id", str(direccion_id)).limit(1).execute()
+        if not result.data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dirección no encontrada.")
+        was_default = bool(result.data[0].get("es_predeterminada"))
+        supabase.table("direcciones_cliente").delete().eq("cliente_id", cid).eq("id", str(direccion_id)).execute()
+        if was_default:
+            remaining = supabase.table("direcciones_cliente").select("id").eq("cliente_id", cid).order("created_at").limit(1).execute().data or []
+            if remaining:
+                supabase.table("direcciones_cliente").update({"es_predeterminada": True}).eq("cliente_id", cid).eq("id", remaining[0]["id"]).execute()
+        return None
+
+    current = _DIRECCIONES_DB.get(cid, [])
+    removed = next((item for item in current if item.id == direccion_id), None)
+    if not removed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dirección no encontrada.")
+    remaining = [item for item in current if item.id != direccion_id]
+    if removed.es_predeterminada and remaining:
+        remaining[0].es_predeterminada = True
+    _DIRECCIONES_DB[cid] = remaining
+    return None
 
 @router.patch("/{cliente_id}/notificaciones")
 async def actualizar_preferencias_notificacion(cliente_id: uuid.UUID, payload: NotificacionesConfig):

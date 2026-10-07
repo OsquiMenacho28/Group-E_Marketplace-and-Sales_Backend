@@ -1,6 +1,6 @@
 from typing import Optional, Dict
 from uuid import UUID
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 class ClienteRegistro(BaseModel):
     nombre_completo: str = Field(..., min_length=2, description="Nombre completo del cliente")
@@ -41,10 +41,27 @@ class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
 class DireccionCreate(BaseModel):
-    direccion: str
-    referencia: Optional[str] = None
-    ciudad: str
+    direccion: str = Field(..., min_length=3, max_length=255)
+    referencia: Optional[str] = Field(None, max_length=500)
+    ciudad: str = Field(..., min_length=2, max_length=100)
+    latitud: Optional[float] = Field(None, ge=-90, le=90)
+    longitud: Optional[float] = Field(None, ge=-180, le=180)
     es_predeterminada: bool = False
+
+    @model_validator(mode="after")
+    def validar_coordenadas_pareadas(self):
+        if (self.latitud is None) != (self.longitud is None):
+            raise ValueError("Latitud y longitud deben proporcionarse juntas.")
+        return self
+
+
+class DireccionUpdate(BaseModel):
+    direccion: Optional[str] = Field(None, min_length=3, max_length=255)
+    referencia: Optional[str] = Field(None, max_length=500)
+    ciudad: Optional[str] = Field(None, min_length=2, max_length=100)
+    latitud: Optional[float] = Field(None, ge=-90, le=90)
+    longitud: Optional[float] = Field(None, ge=-180, le=180)
+    es_predeterminada: Optional[bool] = None
 
 class DireccionResponse(DireccionCreate):
     id: UUID

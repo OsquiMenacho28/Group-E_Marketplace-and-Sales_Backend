@@ -113,11 +113,44 @@ CREATE TABLE IF NOT EXISTS direcciones_cliente (
     direccion VARCHAR(255) NOT NULL,
     referencia TEXT,
     ciudad VARCHAR(100) NOT NULL,
-    latitud NUMERIC(10, 7),
-    longitud NUMERIC(10, 7),
-    es_predeterminada BOOLEAN DEFAULT FALSE,
+    latitud NUMERIC(10, 7) CHECK (latitud BETWEEN -90 AND 90),
+    longitud NUMERIC(10, 7) CHECK (longitud BETWEEN -180 AND 180),
+    es_predeterminada BOOLEAN NOT NULL DEFAULT FALSE,
+    CONSTRAINT chk_direccion_coordenadas_pareadas CHECK ((latitud IS NULL) = (longitud IS NULL)),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+ALTER TABLE direcciones_cliente ADD COLUMN IF NOT EXISTS referencia TEXT;
+ALTER TABLE direcciones_cliente ADD COLUMN IF NOT EXISTS latitud NUMERIC(10, 7);
+ALTER TABLE direcciones_cliente ADD COLUMN IF NOT EXISTS longitud NUMERIC(10, 7);
+ALTER TABLE direcciones_cliente ADD COLUMN IF NOT EXISTS es_predeterminada BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE direcciones_cliente
+SET latitud = NULL, longitud = NULL
+WHERE (latitud IS NULL) <> (longitud IS NULL);
+WITH direcciones_duplicadas AS (
+    SELECT id,
+           ROW_NUMBER() OVER (PARTITION BY cliente_id ORDER BY es_predeterminada DESC, created_at, id) AS posicion
+    FROM direcciones_cliente
+    WHERE es_predeterminada = TRUE
+)
+UPDATE direcciones_cliente AS direccion
+SET es_predeterminada = FALSE
+FROM direcciones_duplicadas AS duplicada
+WHERE direccion.id = duplicada.id AND duplicada.posicion > 1;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_direccion_latitud') THEN
+        ALTER TABLE direcciones_cliente ADD CONSTRAINT chk_direccion_latitud CHECK (latitud IS NULL OR latitud BETWEEN -90 AND 90);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_direccion_longitud') THEN
+        ALTER TABLE direcciones_cliente ADD CONSTRAINT chk_direccion_longitud CHECK (longitud IS NULL OR longitud BETWEEN -180 AND 180);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_direccion_coordenadas_pareadas') THEN
+        ALTER TABLE direcciones_cliente ADD CONSTRAINT chk_direccion_coordenadas_pareadas CHECK ((latitud IS NULL) = (longitud IS NULL));
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_direcciones_cliente_predeterminada
+    ON direcciones_cliente (cliente_id) WHERE es_predeterminada = TRUE;
 
 CREATE TABLE IF NOT EXISTS puntos_fidelidad (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

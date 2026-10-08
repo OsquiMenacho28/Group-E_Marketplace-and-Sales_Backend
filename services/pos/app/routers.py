@@ -1,10 +1,17 @@
+import base64
+import io
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
+from urllib.parse import urlencode
+
+import qrcode
+from qrcode.image.svg import SvgPathImage
 from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas import (
     AbrirCajaRequest, CerrarCajaRequest, CajaResponse,
-    VentaPOSRequest, VentaPOSResponse, VentaSuspendida
+    ItemTicketPOS, VentaPOSRequest, VentaPOSResponse, VentaSuspendida
 )
 from backend.shared.erp_clients.pagos import pagos_client
 from backend.shared.erp_clients.inventarios import inventarios_client
@@ -14,6 +21,16 @@ router = APIRouter(prefix="/api/v1/pos", tags=["Punto de Venta"])
 
 _CAJAS_ACTIVAS = {}
 _VENTAS_SUSPENDIDAS = {}
+_NIT_EMISOR = "1028374029"
+_IVA_RATE = Decimal("0.13")
+
+
+def _qr_data_url(payload: str) -> str:
+    image = qrcode.make(payload, image_factory=SvgPathImage, box_size=5, border=3)
+    output = io.BytesIO()
+    image.save(output)
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
 
 @router.post("/caja/abrir", response_model=CajaResponse, status_code=status.HTTP_201_CREATED)
 @require_jwt_claims("sub", allowed_roles={"cajero", "administrador"})
@@ -56,11 +73,62 @@ async def procesar_venta_pos(
     if not caja or caja.estado != "abierta":
         raise HTTPException(status_code=403, detail="La caja no está abierta para procesar ventas")
 
-    total = sum(i.cantidad * i.precio_unitario for i in payload.items)
+    lineas = [
+        ItemTicketPOS(
+            sku=item.sku,
+            nombre=item.nombre,
+            cantidad=item.cantidad,
+            precio_unitario=item.precio_unitario,
+            total_linea=(item.precio_unitario * item.cantidad).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        )
+        for item in payload.items
+    ]
+    total = sum((linea.total_linea for linea in lineas), Decimal("0.00")).quantize(Decimal("0.01"))
+    monto_iva = (total * _IVA_RATE / (Decimal("1.00") + _IVA_RATE)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    subtotal_neto = total - monto_iva
     orden_id = uuid.uuid4()
     codigo_orden = f"POS-{uuid.uuid4().hex[:6].upper()}"
 
-    # Acumular en caja
+    # Timbrado fiscal RIO-PAG-02
+    factura_data = await pagos_client.emitir_factura({
+        "orden_id": str(orden_id),
+        "codigo_orden": codigo_orden,
+        "sucursal_id": str(payload.sucursal_id),
+        "nit_ci": payload.cliente_nit_ci,
+        "razon_social": payload.cliente_razon_social,
+        "subtotal_neto": float(subtotal_neto),
+        "monto_iva": float(monto_iva),
+        "monto_total": float(total),
+        "metodo_pago": payload.metodo_pago,
+        "items": [
+            {
+                "variante_id": str(item.variante_id),
+                "sku": item.sku,
+                "nombre": item.nombre,
+                "cantidad": item.cantidad,
+                "precio_unitario": float(item.precio_unitario),
+                "total_linea": float(linea.total_linea),
+            }
+            for item, linea in zip(payload.items, lineas)
+        ],
+    })
+
+    numero_factura = factura_data.get("numero_factura")
+    cuf = factura_data.get("cuf")
+    if not numero_factura or not cuf:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="El servicio tributario no devolvió número de factura y CUF.")
+
+    qr_url = factura_data.get("qr_url") or factura_data.get("codigo_qr") or (
+        "https://pilotosiat.impuestos.gob.bo/consulta/QR?" + urlencode({
+            "nit": _NIT_EMISOR,
+            "cuf": cuf,
+            "numero": numero_factura,
+            "t": f"{total:.2f}",
+        })
+    )
+    qr_code = _qr_data_url(qr_url)
+
+    # Acumular en caja cuando la factura ya fue timbrada.
     if payload.metodo_pago == "efectivo":
         caja.total_efectivo += total
     elif payload.metodo_pago == "tarjeta":
@@ -68,38 +136,50 @@ async def procesar_venta_pos(
     else:
         caja.total_qr += total
 
-    # Timbrado fiscal RIO-PAG-02
-    factura_data = await pagos_client.emitir_factura({
-        "orden_id": str(orden_id),
-        "nit_ci": payload.cliente_nit_ci,
-        "razon_social": payload.cliente_razon_social,
-        "monto_total": float(total)
-    })
-
     # Descuento en inventario local RIO-INV-03
     await inventarios_client.descuento_definitivo(reserva_id="pos-direct", orden_id=str(orden_id))
 
+    ancho = 42
+    separador = "-" * ancho
+    detalle_items = "\n".join(
+        f"{linea.cantidad} x {linea.nombre[:20]}\n  SKU {linea.sku[:18]} @ BOB {linea.precio_unitario:.2f}  BOB {linea.total_linea:.2f}"
+        for linea in lineas
+    )
     ticket = f"""
     ========================================
              MAXICONECTA - SUCURSAL
     ========================================
     Orden: {codigo_orden}
+    Fecha: {datetime.now().astimezone().strftime('%d/%m/%Y %H:%M')}
     NIT/CI: {payload.cliente_nit_ci}
     Cliente: {payload.cliente_razon_social}
-    Total: BOB {total:.2f}
+    {separador}
+    DETALLE DE ÍTEMS
+    {detalle_items}
+    {separador}
+    Subtotal neto: BOB {subtotal_neto:.2f}
+    IVA (13% incluido): BOB {monto_iva:.2f}
+    TOTAL: BOB {total:.2f}
     Método: {payload.metodo_pago.upper()}
-    Factura No: {factura_data.get('numero_factura')}
-    CUF: {factura_data.get('cuf')}
+    Factura No: {numero_factura}
+    CUF: {cuf}
+    QR tributario: {qr_url}
     ========================================
     """
 
     return VentaPOSResponse(
         orden_id=orden_id,
         codigo_orden=codigo_orden,
+        subtotal_neto=subtotal_neto,
+        monto_iva=monto_iva,
         total=total,
         metodo_pago=payload.metodo_pago,
-        numero_factura=factura_data.get("numero_factura"),
-        cuf=factura_data.get("cuf"),
+        numero_factura=numero_factura,
+        cuf=cuf,
+        cufd=factura_data.get("cufd"),
+        qr_url=qr_url,
+        qr_code=qr_code,
+        items=lineas,
         ticket_impresion=ticket.strip()
     )
 

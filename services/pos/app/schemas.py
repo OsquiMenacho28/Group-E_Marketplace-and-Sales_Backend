@@ -37,13 +37,26 @@ class VentaPOSRequest(BaseModel):
     items: List[ItemVentaPOS]
     metodo_pago: str = "efectivo" # efectivo | tarjeta | qr
 
+class ItemTicketPOS(BaseModel):
+    sku: str
+    nombre: str
+    cantidad: int
+    precio_unitario: Decimal
+    total_linea: Decimal
+
 class VentaPOSResponse(BaseModel):
     orden_id: UUID
     codigo_orden: str
+    subtotal_neto: Decimal
+    monto_iva: Decimal
     total: Decimal
     metodo_pago: str
     numero_factura: Optional[int] = None
     cuf: Optional[str] = None
+    cufd: Optional[str] = None
+    qr_url: str
+    qr_code: str
+    items: List[ItemTicketPOS]
     ticket_impresion: str
 
 class VentaSuspendida(BaseModel):

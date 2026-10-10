@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 from uuid import UUID
 from datetime import datetime, date
 from decimal import Decimal
@@ -15,12 +15,20 @@ class ItemOrdenResponse(ItemOrdenCreate):
     id: UUID
     total_linea: Decimal
 
+class DatosFiscalesPayload(BaseModel):
+    modalidad: Optional[str] = "con_factura"
+    tipo_documento: Optional[str] = "NIT"
+    nit_ci: Optional[str] = "0"
+    razon_social: Optional[str] = "CONSUMIDOR FINAL"
+    email_facturacion: Optional[str] = None
+    guardar_perfil: Optional[bool] = True
+
 class OrdenCreate(BaseModel):
-    cliente_id: UUID
-    sucursal_id: Optional[UUID] = None
+    cliente_id: Any
+    sucursal_id: Optional[Any] = None
     canal: str = "web"
     tipo_despacho: str = "domicilio" # domicilio | retiro_sucursal
-    direccion_entrega_id: Optional[UUID] = None
+    direccion_entrega_id: Optional[Any] = None
     subtotal: Decimal
     descuento: Decimal = Decimal("0.0")
     costo_envio: Decimal = Decimal("0.0")
@@ -28,11 +36,12 @@ class OrdenCreate(BaseModel):
     metodo_pago: str = "tarjeta"
     items: List[ItemOrdenCreate]
     reserva_id: Optional[str] = None
+    datos_fiscales: Optional[DatosFiscalesPayload] = None
 
 class OrdenResponse(BaseModel):
     id: UUID
     codigo_orden: str
-    cliente_id: UUID
+    cliente_id: Any
     canal: str
     tipo_despacho: str
     subtotal: Decimal
@@ -40,6 +49,8 @@ class OrdenResponse(BaseModel):
     estado: str # pendiente, confirmada, en_preparacion, despachada, entregada, cancelada
     tracking_number: Optional[str] = None
     cuf_factura: Optional[str] = None
+    numero_factura: Optional[int] = None
+    factura: Optional[dict] = None
     created_at: datetime
     items: List[ItemOrdenResponse] = []
 

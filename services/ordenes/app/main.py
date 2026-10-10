@@ -1,6 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import router
+try:
+    from app.routers import router
+    from app.routers_facturacion import router as facturacion_router
+except (ModuleNotFoundError, ImportError):
+    from backend.services.ordenes.app.routers import router
+    from backend.services.ordenes.app.routers_facturacion import router as facturacion_router
 from backend.shared.exceptions import MaxiConectaException, maxiconecta_exception_handler
 
 app = FastAPI(
@@ -19,6 +24,7 @@ app.add_middleware(
 
 app.add_exception_handler(MaxiConectaException, maxiconecta_exception_handler)
 app.include_router(router)
+app.include_router(facturacion_router)
 
 @app.get("/health", tags=["Salud"])
 async def health():

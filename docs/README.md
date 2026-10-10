@@ -31,6 +31,8 @@ El proyecto abarca una solución omnicanal completa (canales digitales y puntos 
    - Auditoría completa de cambios desde la versión base (`version1`): modelos, endpoints, stores, UI de checkout con TTL 15 min, contratos RIO y pruebas automatizadas.
 10. **[10 - Bitácora de Cambios Técnicos — Búsqueda Facetada (US-06 / RF-06)](./10-bitacora-cambios-ft-busqueda-facetada.md)**
    - Motor de búsqueda Full-Text Search insensible a tildes, índices GIN en PostgreSQL, endpoints de agregación facetada, autocompletado predictivo (*typeahead*) y panel lateral interactivo en Vue 3.
+11. **[11 - Contrato de API y Eventos con ERP de Inventarios — Google Cloud Pub/Sub (US-40 / RF-40 / KAN-56)](./11-contrato-eventos-inventarios-pubsub.md)**
+   - Especificación formal del contrato CloudEvents v1.0, tópico `ucb-sis323`, sincronización de descuentos (RIO-INV-03) y reintegros (RIO-INV-04), pruebas de integración y fallback offline.
 
 
 ---

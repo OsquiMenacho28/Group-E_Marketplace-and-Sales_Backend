@@ -10,6 +10,8 @@ try:
         ReservaConsultaResponse, CancelarReservaResponse,
         WishlistAdd, WishlistResponse
     )
+    from app import cupones_store
+    from app.cupones_engine import evaluar_cupon
 except (ModuleNotFoundError, ImportError):
     from backend.services.carrito.app.schemas import (
         ItemCarritoAdd, ItemCarritoResponse, ItemCarritoUpdate, CarritoResponse,
@@ -17,6 +19,8 @@ except (ModuleNotFoundError, ImportError):
         ReservaConsultaResponse, CancelarReservaResponse,
         WishlistAdd, WishlistResponse
     )
+    from backend.services.carrito.app import cupones_store
+    from backend.services.carrito.app.cupones_engine import evaluar_cupon
 from backend.shared.redis_client import (
     get_cart_from_cache, save_cart_to_cache, delete_cart_from_cache,
     lock_stock_reservation, crear_reserva_stock, consultar_reserva,
@@ -29,10 +33,17 @@ from backend.shared.database import get_supabase_client
 
 router = APIRouter(prefix="/api/v1/carrito", tags=["Carrito y Checkout"])
 
-_CUPONES_VALIDOS = {
-    "MAXI10": Decimal("10.0"),  # 10%
-    "BIENVENIDO": Decimal("20.0") # 20 BOB
-}
+async def _descuento_vigente(raw: dict, subtotal: Decimal) -> Decimal:
+    """
+    RF-17: recalcula el descuento del cupón guardado en el carrito contra el
+    subtotal actual (si se quitan ítems y ya no se cumple el monto mínimo, o el
+    cupón venció/se desactivó, el descuento deja de aplicarse).
+    """
+    codigo = raw.get("cupon")
+    if not codigo:
+        return Decimal("0.0")
+    resultado = evaluar_cupon(await cupones_store.obtener(codigo), subtotal, codigo_solicitado=codigo)
+    return resultado.descuento if resultado.valido else Decimal("0.0")
 
 
 async def _validar_stock_carrito(items: List[dict], sku: str) -> None:
@@ -59,7 +70,7 @@ async def ver_carrito(identificador: str):
         ) for i in raw.get("items", [])
     ]
     subtotal = sum(i.total_linea for i in items)
-    descuento = Decimal(str(raw.get("descuento", "0.0")))
+    descuento = await _descuento_vigente(raw, subtotal)
     return CarritoResponse(
         cliente_o_sesion_id=identificador,
         items=items,
@@ -119,15 +130,25 @@ async def actualizar_cantidad_item(identificador: str, variante_id: str, payload
 
 @router.post("/{identificador}/cupon", response_model=CarritoResponse)
 async def aplicar_cupon(identificador: str, payload: AplicarCuponRequest):
-    """RF-17: Validar y aplicar cupón de descuento."""
-    codigo = payload.codigo.upper()
-    if codigo not in _CUPONES_VALIDOS:
-        raise HTTPException(status_code=400, detail="Cupón no válido o vencido")
-
+    """RF-17: Validar (vigencia, monto mínimo, límite de canjes) y aplicar cupón de descuento."""
+    codigo = payload.codigo.strip().upper()
     raw = await get_cart_from_cache(identificador)
     subtotal = sum(Decimal(str(item["cantidad"])) * Decimal(str(item["precio_unitario"])) for item in raw.get("items", []))
-    raw["cupon"] = codigo
-    raw["descuento"] = float(subtotal * Decimal("0.10")) if codigo == "MAXI10" else float(_CUPONES_VALIDOS[codigo])
+    resultado = evaluar_cupon(await cupones_store.obtener(codigo), subtotal, codigo_solicitado=codigo)
+    if not resultado.valido:
+        raise HTTPException(status_code=400, detail=resultado.mensaje)
+
+    raw["cupon"] = resultado.codigo
+    raw["descuento"] = float(resultado.descuento)
+    await save_cart_to_cache(identificador, raw)
+    return await ver_carrito(identificador)
+
+@router.delete("/{identificador}/cupon", response_model=CarritoResponse)
+async def quitar_cupon(identificador: str):
+    """RF-17: Quitar el cupón aplicado al carrito."""
+    raw = await get_cart_from_cache(identificador)
+    raw.pop("cupon", None)
+    raw.pop("descuento", None)
     await save_cart_to_cache(identificador, raw)
     return await ver_carrito(identificador)
 
@@ -169,7 +190,7 @@ async def iniciar_checkout(identificador: str, payload: CheckoutInitRequest):
     ]
 
     subtotal = sum(i.total_linea for i in items_response)
-    descuento = Decimal(str(raw.get("descuento", "0.0")))
+    descuento = await _descuento_vigente(raw, subtotal)
     total = max(Decimal("0.0"), subtotal - descuento)
 
     return CheckoutInitResponse(

@@ -39,19 +39,46 @@ def _category_value(value: Any) -> Optional[Dict[str, Any]]:
 
 
 def _product_response(client: Any, row: Dict[str, Any]) -> ProductoResponse:
-    category_result = client.table("categorias").select("id,nombre,descripcion,padre_id,atributos_dinamicos,activo").eq("id", row["categoria_id"]).limit(1).execute()
-    variants = client.table("variantes").select("*").eq("producto_id", row["id"]).order("created_at").execute().data
-    images = client.table("imagenes_producto").select("*").eq("producto_id", row["id"]).order("orden").execute().data
-    primary_variant = variants[0] if variants else {}
-    return ProductoResponse.model_validate(
-        {
+    return _products_response(client, [row])[0]
+
+
+def _products_response(client: Any, rows: List[Dict[str, Any]]) -> List[ProductoResponse]:
+    """Carga todas las relaciones del lote con una consulta por tabla, no por producto."""
+    if not rows:
+        return []
+
+    product_ids = list(dict.fromkeys(str(row["id"]) for row in rows))
+    category_ids = list(dict.fromkeys(str(row["categoria_id"]) for row in rows if row.get("categoria_id")))
+
+    categories = []
+    if category_ids:
+        categories = client.table("categorias").select(
+            "id,nombre,descripcion,padre_id,atributos_dinamicos,activo"
+        ).in_("id", category_ids).execute().data or []
+
+    variants = client.table("variantes").select("*").in_("producto_id", product_ids).order("created_at").execute().data or []
+    images = client.table("imagenes_producto").select("*").in_("producto_id", product_ids).order("orden").execute().data or []
+
+    categories_by_id = {str(category["id"]): category for category in categories}
+    variants_by_product: Dict[str, List[Dict[str, Any]]] = {}
+    images_by_product: Dict[str, List[Dict[str, Any]]] = {}
+    for variant in variants:
+        variants_by_product.setdefault(str(variant["producto_id"]), []).append(variant)
+    for image in images:
+        images_by_product.setdefault(str(image["producto_id"]), []).append(image)
+
+    products = []
+    for row in rows:
+        product_variants = variants_by_product.get(str(row["id"]), [])
+        primary_variant = product_variants[0] if product_variants else {}
+        products.append(ProductoResponse.model_validate({
             **row,
             "precio": primary_variant.get("precio", 0),
-            "categorias": _category_value(category_result.data),
-            "variantes": variants,
-            "imagenes_producto": images,
-        }
-    )
+            "categorias": categories_by_id.get(str(row.get("categoria_id"))),
+            "variantes": product_variants,
+            "imagenes_producto": images_by_product.get(str(row["id"]), []),
+        }))
+    return products
 
 
 def _decode_image(data_url: str) -> tuple[str, bytes]:
@@ -99,7 +126,7 @@ async def listar_productos(
     if categoria_id:
         query = query.eq("categoria_id", str(categoria_id))
     result = query.order("created_at", desc=True).execute()
-    products = [_product_response(client, row) for row in result.data]
+    products = _products_response(client, result.data or [])
     if precio_min is not None:
         products = [product for product in products if product.precio >= precio_min]
     if precio_max is not None:

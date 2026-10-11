@@ -147,6 +147,17 @@ async def crear_orden(payload: OrdenCreate):
     except Exception as e:
         logger.warning(f"Aviso comunicando con ERP Pagos: {e}")
 
+    # RIO-INV-03 / KAN-56 / KAN-284: Descuento definitivo de existencias y publicación Pub/Sub
+    try:
+        items_payload = [{"sku": i.sku, "cantidad": i.cantidad, "nombre": i.nombre_producto} for i in payload.items]
+        await inventarios_client.descuento_definitivo(
+            reserva_id=payload.reserva_id or f"RES-DIR-{orden_id.hex[:6]}",
+            orden_id=str(orden_id),
+            items=items_payload
+        )
+    except Exception as e:
+        logger.warning(f"Aviso comunicando descuento definitivo con Inventarios: {e}")
+
     items_res = [
         ItemOrdenResponse(
             id=uuid.uuid4(),

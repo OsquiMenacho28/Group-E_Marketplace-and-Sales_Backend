@@ -2,8 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from app.routers import router
+    from app.cupones_router import router as cupones_router
 except (ModuleNotFoundError, ImportError):
     from backend.services.carrito.app.routers import router
+    from backend.services.carrito.app.cupones_router import router as cupones_router
 from backend.shared.exceptions import MaxiConectaException, maxiconecta_exception_handler
 
 app = FastAPI(
@@ -21,6 +23,8 @@ app.add_middleware(
 )
 
 app.add_exception_handler(MaxiConectaException, maxiconecta_exception_handler)
+# El router de cupones va primero: /cupones no debe capturarse como /{identificador}.
+app.include_router(cupones_router)
 app.include_router(router)
 
 @app.get("/health", tags=["Salud"])
